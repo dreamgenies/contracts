@@ -44,7 +44,7 @@ fn test_update_patient() {
     client.register_patient(&patient_wallet, &name, &dob, &initial_metadata);
 
     let new_metadata = String::from_str(&env, "ipfs://updated-history");
-    client.update_patient(&patient_wallet, &new_metadata);
+    client.update_patient(&patient_wallet, &patient_wallet, &new_metadata);
 
     let patient_data = client.get_patient(&patient_wallet);
     assert_eq!(patient_data.metadata, new_metadata);
@@ -169,8 +169,8 @@ fn test_grant_access_and_add_medical_record() {
 
     client.initialize(&admin);
     client.publish_consent_version(&v1);
-    client.acknowledge_consent(&patient, &v1);
-    client.grant_access(&patient, &doctor);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
     client.add_medical_record(&patient, &doctor, &hash, &desc);
 
     let records = client.get_medical_records(&patient);
@@ -210,8 +210,8 @@ fn test_revoke_access() {
 
     env.mock_all_auths();
 
-    client.grant_access(&patient, &doctor);
-    client.revoke_access(&patient, &doctor);
+    client.grant_access(&patient, &patient, &doctor);
+    client.revoke_access(&patient, &patient, &doctor);
 
     let doctors = client.get_authorized_doctors(&patient);
     assert_eq!(doctors.len(), 0);
@@ -266,7 +266,7 @@ fn test_consent_status_acknowledged() {
     env.mock_all_auths();
     client.initialize(&admin);
     client.publish_consent_version(&v1);
-    client.acknowledge_consent(&patient, &v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
 
     assert_eq!(client.get_consent_status(&patient), ConsentStatus::Acknowledged);
 }
@@ -284,7 +284,7 @@ fn test_consent_status_pending_after_new_version() {
     env.mock_all_auths();
     client.initialize(&admin);
     client.publish_consent_version(&v1);
-    client.acknowledge_consent(&patient, &v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
 
     // Admin publishes new version — patient is now Pending
     client.publish_consent_version(&v2);
@@ -304,9 +304,9 @@ fn test_consent_re_acknowledge_restores_acknowledged() {
     env.mock_all_auths();
     client.initialize(&admin);
     client.publish_consent_version(&v1);
-    client.acknowledge_consent(&patient, &v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
     client.publish_consent_version(&v2);
-    client.acknowledge_consent(&patient, &v2);
+    client.acknowledge_consent(&patient, &patient, &v2);
 
     assert_eq!(client.get_consent_status(&patient), ConsentStatus::Acknowledged);
 }
@@ -323,7 +323,7 @@ fn test_acknowledge_wrong_version_panics() {
     env.mock_all_auths();
     client.initialize(&admin);
     client.publish_consent_version(&make_version(&env, 1));
-    client.acknowledge_consent(&patient, &make_version(&env, 99));
+    client.acknowledge_consent(&patient, &patient, &make_version(&env, 99));
 }
 
 #[test]
@@ -340,7 +340,7 @@ fn test_add_record_blocked_without_consent() {
     client.initialize(&admin);
     client.publish_consent_version(&make_version(&env, 1));
     // Patient never acknowledges
-    client.grant_access(&patient, &doctor);
+    client.grant_access(&patient, &patient, &doctor);
     client.add_medical_record(
         &patient,
         &doctor,
@@ -362,8 +362,8 @@ fn test_add_record_allowed_after_consent() {
     env.mock_all_auths();
     client.initialize(&admin);
     client.publish_consent_version(&v1);
-    client.acknowledge_consent(&patient, &v1);
-    client.grant_access(&patient, &doctor);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
     client.add_medical_record(
         &patient,
         &doctor,
@@ -389,8 +389,8 @@ fn test_add_record_blocked_after_new_version() {
     env.mock_all_auths();
     client.initialize(&admin);
     client.publish_consent_version(&v1);
-    client.acknowledge_consent(&patient, &v1);
-    client.grant_access(&patient, &doctor);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
 
     // Admin bumps version — patient must re-acknowledge
     client.publish_consent_version(&v2);
@@ -400,4 +400,161 @@ fn test_add_record_blocked_after_new_version() {
         &Bytes::from_array(&env, &[1, 2, 3]),
         &String::from_str(&env, "Post-update record"),
     );
+}
+
+/// ------------------------------------------------
+/// GUARDIAN TESTS
+/// ------------------------------------------------
+
+fn setup_with_consent(env: &Env) -> (MedicalRegistryClient, Address) {
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    client.publish_consent_version(&make_version(env, 1));
+    (client, admin)
+}
+
+#[test]
+fn test_assign_and_get_guardian() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let patient = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    client.assign_guardian(&patient, &guardian);
+    assert_eq!(client.get_guardian(&patient), Some(guardian));
+}
+
+#[test]
+fn test_revoke_guardian() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let patient = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    client.assign_guardian(&patient, &guardian);
+    client.revoke_guardian(&patient);
+    assert_eq!(client.get_guardian(&patient), None);
+}
+
+#[test]
+fn test_guardian_can_acknowledge_consent() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let v1 = make_version(&env, 1);
+    let patient = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    client.assign_guardian(&patient, &guardian);
+    client.acknowledge_consent(&patient, &guardian, &v1);
+
+    assert_eq!(client.get_consent_status(&patient), ConsentStatus::Acknowledged);
+}
+
+#[test]
+fn test_guardian_can_grant_and_revoke_access() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let v1 = make_version(&env, 1);
+    let patient = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let doctor = Address::generate(&env);
+
+    client.assign_guardian(&patient, &guardian);
+    client.acknowledge_consent(&patient, &guardian, &v1);
+    client.grant_access(&patient, &guardian, &doctor);
+
+    assert_eq!(client.get_authorized_doctors(&patient).len(), 1);
+
+    client.revoke_access(&patient, &guardian, &doctor);
+    assert_eq!(client.get_authorized_doctors(&patient).len(), 0);
+}
+
+#[test]
+fn test_guardian_can_update_patient() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let patient = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    client.register_patient(
+        &patient,
+        &String::from_str(&env, "Minor Patient"),
+        &631152000,
+        &String::from_str(&env, "ipfs://original"),
+    );
+    client.assign_guardian(&patient, &guardian);
+    client.update_patient(&patient, &guardian, &String::from_str(&env, "ipfs://updated"));
+
+    assert_eq!(
+        client.get_patient(&patient).metadata,
+        String::from_str(&env, "ipfs://updated")
+    );
+}
+
+#[test]
+fn test_guardian_enables_record_write() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let v1 = make_version(&env, 1);
+    let patient = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let doctor = Address::generate(&env);
+
+    client.assign_guardian(&patient, &guardian);
+    client.acknowledge_consent(&patient, &guardian, &v1);
+    client.grant_access(&patient, &guardian, &doctor);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &Bytes::from_array(&env, &[5, 6, 7]),
+        &String::from_str(&env, "Guardian-approved record"),
+    );
+
+    assert_eq!(client.get_medical_records(&patient).len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Caller is not patient or assigned guardian")]
+fn test_unauthorized_caller_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let v1 = make_version(&env, 1);
+    let patient = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.acknowledge_consent(&patient, &stranger, &v1);
+}
+
+#[test]
+#[should_panic(expected = "Caller is not patient or assigned guardian")]
+fn test_revoked_guardian_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let v1 = make_version(&env, 1);
+    let patient = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    client.assign_guardian(&patient, &guardian);
+    client.revoke_guardian(&patient);
+    // Guardian no longer valid
+    client.acknowledge_consent(&patient, &guardian, &v1);
+}
+
+#[test]
+#[should_panic(expected = "Caller is not patient or assigned guardian")]
+fn test_guardian_cannot_act_for_different_patient() {
+    let env = Env::default();
+    let (client, _admin) = setup_with_consent(&env);
+    let v1 = make_version(&env, 1);
+    let patient_a = Address::generate(&env);
+    let patient_b = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    // Guardian assigned only to patient_a
+    client.assign_guardian(&patient_a, &guardian);
+    // Attempt to act on behalf of patient_b
+    client.acknowledge_consent(&patient_b, &guardian, &v1);
 }

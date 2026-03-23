@@ -52,6 +52,7 @@ pub enum DataKey {
     Admin,
     ConsentVersion,
     ConsentAck(Address),
+    Guardian(Address),
 }
 
 #[contracttype]
@@ -61,6 +62,18 @@ pub struct MedicalRecord {
     pub record_hash: Bytes,
     pub description: String,
     pub timestamp: u64,
+}
+
+fn require_patient_or_guardian(env: &Env, patient: &Address, caller: &Address) {
+    let guardian_key = DataKey::Guardian(patient.clone());
+    let guardian_opt: Option<Address> = env.storage().persistent().get(&guardian_key);
+    if caller == patient {
+        caller.require_auth();
+    } else if guardian_opt.as_ref() == Some(caller) {
+        caller.require_auth();
+    } else {
+        panic!("Caller is not patient or assigned guardian");
+    }
 }
 
 #[contract]
@@ -95,8 +108,48 @@ impl MedicalRegistry {
         );
     }
 
-    pub fn acknowledge_consent(env: Env, patient: Address, version_hash: BytesN<32>) {
-        patient.require_auth();
+    pub fn assign_guardian(env: Env, patient: Address, guardian: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        // Prevent a guardian from being assigned as guardian of another patient
+        // (no delegation chain: guardian must not itself have a guardian entry as a patient)
+        env.storage()
+            .persistent()
+            .set(&DataKey::Guardian(patient.clone()), &guardian);
+        env.events().publish(
+            (symbol_short!("grd_asgn"), patient),
+            guardian,
+        );
+    }
+
+    pub fn revoke_guardian(env: Env, patient: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Guardian(patient.clone()));
+        env.events().publish(
+            (symbol_short!("grd_rev"), patient),
+            symbol_short!("revoked"),
+        );
+    }
+
+    pub fn get_guardian(env: Env, patient: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Guardian(patient))
+    }
+
+    pub fn acknowledge_consent(env: Env, patient: Address, caller: Address, version_hash: BytesN<32>) {
+        require_patient_or_guardian(&env, &patient, &caller);
         let current: BytesN<32> = env
             .storage()
             .persistent()
@@ -159,8 +212,8 @@ impl MedicalRegistry {
             .publish((symbol_short!("reg_pat"), wallet), symbol_short!("success"));
     }
 
-    pub fn update_patient(env: Env, wallet: Address, metadata: String) {
-        wallet.require_auth();
+    pub fn update_patient(env: Env, wallet: Address, caller: Address, metadata: String) {
+        require_patient_or_guardian(&env, &wallet, &caller);
 
         let key = DataKey::Patient(wallet.clone());
         let mut patient: PatientData = env
@@ -266,8 +319,8 @@ impl MedicalRegistry {
     //            MEDICAL RECORD ACCESS CONTROL
     // =====================================================
 
-    pub fn grant_access(env: Env, patient: Address, doctor: Address) {
-        patient.require_auth();
+    pub fn grant_access(env: Env, patient: Address, caller: Address, doctor: Address) {
+        require_patient_or_guardian(&env, &patient, &caller);
 
         let key = DataKey::AuthorizedDoctors(patient.clone());
         let mut map: Map<Address, bool> = env
@@ -280,8 +333,8 @@ impl MedicalRegistry {
         env.storage().persistent().set(&key, &map);
     }
 
-    pub fn revoke_access(env: Env, patient: Address, doctor: Address) {
-        patient.require_auth();
+    pub fn revoke_access(env: Env, patient: Address, caller: Address, doctor: Address) {
+        require_patient_or_guardian(&env, &patient, &caller);
 
         let key = DataKey::AuthorizedDoctors(patient.clone());
         let mut map: Map<Address, bool> = env
