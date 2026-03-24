@@ -24,6 +24,18 @@ members = [
   "contracts/hospital-discharge-management",
   "contracts/care-plan",
   "contracts/pacs-integration",
+  "contracts/healthcare-credentialing",
+  "contracts/care-plan" ,
+  "contracts/pacs-integration",
+  "contracts/nutrition-care-management",
+  "contracts/care-plan",
+  "contracts/pacs-integration",
+  "contracts/dental-records",
+  "contracts/mental-health",
+  "contracts/rehabilitation-services",
+  "contracts/prenatal-pediatric",
+  "contracts/hai-tracking",
+  "contracts/medical-device-tracking",
 ]
 
 [workspace.dependencies]
