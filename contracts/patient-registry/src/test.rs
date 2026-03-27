@@ -3,6 +3,8 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     Address, Bytes, BytesN, Env, IntoVal, String, Symbol,
 };
 
@@ -250,7 +252,7 @@ fn test_grant_access_and_add_medical_record() {
     client.grant_access(&patient, &patient, &doctor);
     client.add_medical_record(&patient, &doctor, &hash, &desc, &Symbol::new(&env, "LAB"));
 
-    let records = client.get_medical_records(&patient);
+    let records = client.get_medical_records(&patient, &patient);
     assert_eq!(records.len(), 1);
 
     let record = records.get(0).unwrap();
@@ -363,6 +365,33 @@ fn test_validate_garbage_bytes_rejected() {
 }
 
 #[test]
+fn test_validate_did_ok() {
+    let env = Env::default();
+    let did = String::from_str(&env, "did:web:example.com");
+    assert!(validate_did(&did).is_ok());
+}
+
+#[test]
+fn test_validate_did_rejects_bad_prefix() {
+    let env = Env::default();
+    let did = String::from_str(&env, "notdid:web:x");
+    assert_eq!(validate_did(&did), Err(ContractError::InvalidDID));
+}
+
+#[test]
+fn test_validate_score_ok() {
+    assert!(validate_score(0).is_ok());
+    assert!(validate_score(100).is_ok());
+    assert!(validate_score(50).is_ok());
+}
+
+#[test]
+fn test_validate_score_rejects_out_of_range() {
+    assert_eq!(validate_score(-1), Err(ContractError::InvalidScore));
+    assert_eq!(validate_score(101), Err(ContractError::InvalidScore));
+}
+
+#[test]
 fn test_add_medical_record_rejects_invalid_cid() {
     let env = Env::default();
     let contract_id = env.register(MedicalRegistry, ());
@@ -392,7 +421,7 @@ fn test_add_medical_record_rejects_invalid_cid() {
     );
 
     assert!(matches!(result, Err(Ok(ContractError::InvalidCID))));
-    assert_eq!(client.get_medical_records(&patient).len(), 0);
+    assert_eq!(client.get_medical_records(&patient, &patient).len(), 0);
 }
 
 // ------------------------------------------------
@@ -989,7 +1018,7 @@ fn test_add_record_allowed_after_consent() {
         &Symbol::new(&env, "LAB"),
     );
 
-    assert_eq!(client.get_medical_records(&patient).len(), 1);
+    assert_eq!(client.get_medical_records(&patient, &patient).len(), 1);
 }
 
 #[test]
@@ -1144,7 +1173,7 @@ fn test_guardian_enables_record_write() {
         &Symbol::new(&env, "PRESCRIPTION"),
     );
 
-    assert_eq!(client.get_medical_records(&patient).len(), 1);
+    assert_eq!(client.get_medical_records(&patient, &patient).len(), 1);
 }
 
 #[test]
@@ -1497,9 +1526,10 @@ fn test_fee_can_be_reset_to_zero() {
 // GET_RECORDS_BY_TYPE TESTS
 // ------------------------------------------------
 /// ------------------------------------------------
-/// TTL EXTENSION TESTS
+/// GET_RECORDS_BY_IDS TESTS
 /// ------------------------------------------------
 
+fn setup_for_get_records_by_ids(env: &Env) -> (MedicalRegistryClient<'_>, Address, Address) {
 fn make_ledger_info(sequence: u32, timestamp: u64) -> soroban_sdk::testutils::LedgerInfo {
     soroban_sdk::testutils::LedgerInfo {
         sequence_number: sequence,
@@ -1516,9 +1546,36 @@ fn make_ledger_info(sequence: u32, timestamp: u64) -> soroban_sdk::testutils::Le
 /// Shared setup for TTL tests: initialized contract + registered patient with consent + doctor.
 fn setup_for_ttl(
     env: &Env,
-) -> (MedicalRegistryClient, Address, Address, Address, BytesN<32>) {
+) -> (MedicalRegistryClient<'_>, Address, Address, Address, BytesN<32>) {
     let contract_id = env.register(MedicalRegistry, ());
     let client = MedicalRegistryClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    let fee_token = Address::generate(env);
+    let patient = Address::generate(env);
+    let doctor = Address::generate(env);
+    let v1 = make_version(env, 1);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.register_patient(
+        &patient,
+        &String::from_str(env, "Alice"),
+        &631152000,
+        &String::from_str(env, "ipfs://alice"),
+    );
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.register_doctor(
+        &doctor,
+        &String::from_str(env, "Dr. Bob"),
+        &String::from_str(env, "Cardiology"),
+        &Bytes::from_array(env, &[1, 2, 3]),
+    );
+    client.grant_access(&patient, &patient, &doctor);
+
+
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
     let fee_token = Address::generate(env);
@@ -1548,6 +1605,44 @@ fn setup_for_ttl(
     (client, admin, patient, doctor, v1)
 }
 
+/// ------------------------------------------------
+/// GET_RECORDS_BY_TYPE TESTS
+/// ------------------------------------------------
+
+fn setup_for_filter(env: &Env) -> (MedicalRegistryClient<'_>, Address, Address) {
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    let fee_token = Address::generate(env);
+    let patient = Address::generate(env);
+    let doctor = Address::generate(env);
+    let v1 = make_version(env, 1);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.register_patient(
+        &patient,
+        &String::from_str(env, "Batch Patient"),
+        &631152000,
+        &String::from_str(env, "ipfs://batch"),
+    );
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
+
+    client.register_doctor(
+        &doctor,
+        &String::from_str(env, "Dr. Bob"),
+        &String::from_str(env, "Cardiology"),
+        &Bytes::from_array(env, &[1, 2, 3]),
+    );
+    client.grant_access(&patient, &patient, &doctor);
+
+    (client, patient, doctor)
+}
+
 /// GET_RECORDS_BY_TYPE TESTS
 /// ------------------------------------------------
 
@@ -1564,9 +1659,18 @@ fn test_add_record_extends_patient_ttl() {
     env.ledger().set(make_ledger_info(100, 1_000_000));
 
     let (client, _admin, patient, doctor, _v1) = setup_for_ttl(&env);
+
     client.add_medical_record(
         &patient,
         &doctor,
+        &make_cid_v1(&env, 5),
+        &String::from_str(&env, "Blood test"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    // Verify the records are still accessible after adding
+    let records = client.get_medical_records(&patient, &patient);
+        &String::from_str(&env, "Visit note"),
         &make_cid_v1(&env, 10),
         &String::from_str(&env, "Initial checkup"),
         &Symbol::new(&env, "VISIT"),
@@ -1585,62 +1689,41 @@ fn test_get_records_by_type_returns_matching_records() {
         &doctor,
         &make_cid_v1(&env, 10),
         &String::from_str(&env, "Checkup"),
+        &Symbol::new(&env, "LAB"),
         &Symbol::new(&env, "VISIT"),
     );
 
     // Verify the records are still accessible after adding
-    let records = client.get_medical_records(&patient);
+    let records = client.get_medical_records(&patient, &patient);
     assert_eq!(records.len(), 1);
 }
 
-/// After `get_medical_records`, TTL on the MedicalRecords key is bumped so the
-/// entry remains accessible.
 #[test]
-fn test_get_records_extends_ttl() {
+fn test_get_records_by_type_returns_matching_records() {
     let env = Env::default();
-    env.ledger().set(make_ledger_info(100, 1_000_000));
+    let (client, patient, doctor) = setup_for_filter(&env);
 
     let (client, _admin, patient, doctor, _v1) = setup_for_ttl(&env);
+
     client.add_medical_record(
         &patient,
         &doctor,
-        &make_cid_v1(&env, 10),
+        &make_cid_v1(&env, 6),
         &String::from_str(&env, "CBC panel"),
         &Symbol::new(&env, "LAB"),
     );
-    client.add_medical_record(
-        &patient,
-        &doctor,
-        &make_cid_v1(&env, 11),
-        &String::from_str(&env, "Amoxicillin"),
-        &Symbol::new(&env, "PRESCRIPTION"),
-    );
-    client.add_medical_record(
-        &patient,
-        &doctor,
-        &make_cid_v1(&env, 12),
-        &String::from_str(&env, "Lipid panel"),
-        &Symbol::new(&env, "LAB"),
-    );
 
-    let lab_records = client.get_records_by_type(&patient, &patient, &Symbol::new(&env, "LAB"));
-    assert_eq!(lab_records.len(), 2);
-    assert_eq!(
-        lab_records.get(0).unwrap().description,
-        String::from_str(&env, "CBC panel")
-    );
-    assert_eq!(
-        lab_records.get(1).unwrap().description,
-        String::from_str(&env, "Lipid panel")
-    );
+    // Call get_medical_records — internally bumps TTL
+    let records = client.get_medical_records(&patient, &patient);
+    assert_eq!(records.len(), 1);
 
-    let rx_records =
-        client.get_records_by_type(&patient, &patient, &Symbol::new(&env, "PRESCRIPTION"));
-    assert_eq!(rx_records.len(), 1);
-    assert_eq!(
-        rx_records.get(0).unwrap().description,
-        String::from_str(&env, "Amoxicillin")
-    );
+    // Advance the ledger significantly — data should still be accessible
+    env.ledger().set(make_ledger_info(
+        100 + LEDGER_THRESHOLD - 1,
+        1_000_000 + 1_000,
+    ));
+    let records_after = client.get_medical_records(&patient, &patient);
+    assert_eq!(records_after.len(), 1);
 }
 
 #[test]
@@ -1652,9 +1735,53 @@ fn test_get_records_by_type_returns_empty_when_no_match() {
         &patient,
         &doctor,
         &make_cid_v1(&env, 13),
-        &String::from_str(&env, "Initial record"),
-        &Symbol::new(&env, "VISIT"),
+        &String::from_str(&env, "X-ray"),
+        &Symbol::new(&env, "IMAGING"),
     );
+
+    // No PRESCRIPTION records exist — should return empty vec, not error
+    let result = client.get_records_by_type(&patient, &patient, &Symbol::new(&env, "PRESCRIPTION"));
+    assert_eq!(result.len(), 0);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 6),
+        &String::from_str(&env, "CBC panel"),
+        &Symbol::new(&env, "LAB"),
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 11),
+        &make_cid_v1(&env, 10),
+        &String::from_str(&env, "CBC panel"),
+        &Symbol::new(&env, "LAB"),
+    );
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 15),
+        &String::from_str(&env, "Amoxicillin"),
+        &Symbol::new(&env, "PRESCRIPTION"),
+        &make_cid_v1(env, 20),
+        &String::from_str(env, "Record 0"),
+        &Symbol::new(env, "LAB"),
+    );
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(env, 21),
+        &String::from_str(env, "Record 1"),
+        &Symbol::new(env, "LAB"),
+    );
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(env, 22),
+        &String::from_str(env, "Record 2"),
+        &Symbol::new(env, "LAB"),
+    );
+
+    (client, patient, doctor)
 
     // Call get_medical_records — internally bumps TTL
     let records = client.get_medical_records(&patient);
@@ -1667,6 +1794,49 @@ fn test_get_records_by_type_returns_empty_when_no_match() {
     ));
     let records_after = client.get_medical_records(&patient);
     assert_eq!(records_after.len(), 1);
+}
+
+/// After `get_medical_records`, TTL on the MedicalRecords key is bumped so the
+/// entry remains accessible.
+#[test]
+fn test_get_records_extends_ttl() {
+    let env = Env::default();
+    env.ledger().set(make_ledger_info(100, 1_000_000));
+
+    let (client, _admin, patient, doctor, _v1) = setup_for_ttl(&env);
+
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 13),
+        &String::from_str(&env, "X-ray"),
+        &Symbol::new(&env, "IMAGING"),
+        &String::from_str(&env, "Initial record"),
+        &Symbol::new(&env, "LAB"),
+        &Symbol::new(&env, "VISIT"),
+    );
+
+    // No PRESCRIPTION records exist — should return empty vec, not error
+    let result = client.get_records_by_type(&patient, &patient, &Symbol::new(&env, "PRESCRIPTION"));
+    assert_eq!(result.len(), 0);
+}
+
+#[test]
+fn test_get_records_by_type_returns_empty_when_no_match() {
+    let env = Env::default();
+    let (client, patient, doctor) = setup_for_filter(&env);
+
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 14),
+        &String::from_str(&env, "X-ray"),
+        &Symbol::new(&env, "IMAGING"),
+    );
+
+    // No PRESCRIPTION records exist — should return empty vec, not error
+    let result = client.get_records_by_type(&patient, &patient, &Symbol::new(&env, "PRESCRIPTION"));
+    assert_eq!(result.len(), 0);
 }
 
 /// `extend_patient_ttl` called by the patient themselves must succeed and keep
@@ -1710,11 +1880,15 @@ fn test_extend_patient_ttl_by_admin() {
     assert_eq!(data.name, String::from_str(&env, "Admin User"));
 }
 
-/// `extend_patient_ttl` works even when the patient has no MedicalRecords yet
-/// (optional keys are skipped gracefully).
 #[test]
-fn test_extend_patient_ttl_no_records_yet() {
+fn test_get_records_by_ids_partial_hits_skip_missing() {
     let env = Env::default();
+    let (client, patient, _doctor) = setup_for_get_records_by_ids(&env);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(0);
+    ids.push_back(99);
+    ids.push_back(2);
     env.ledger().set(make_ledger_info(100, 1_000_000));
 
     let (client, _admin, patient, _doctor, _v1) = setup_for_ttl(&env);
@@ -1736,105 +1910,293 @@ fn test_get_records_by_type_returns_empty_when_no_records_at_all() {
     let env = Env::default();
     let (client, patient, _doctor) = setup_for_filter(&env);
 
-    let result = client.get_records_by_type(&patient, &patient, &Symbol::new(&env, "LAB"));
-    assert_eq!(result.len(), 0);
+    let result = client.get_records_by_ids(&patient, &patient, &ids, &false);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get(0).unwrap().description, String::from_str(&env, "Record 0"));
+    assert_eq!(result.get(1).unwrap().description, String::from_str(&env, "Record 2"));
 }
 
 #[test]
-fn test_get_records_by_type_authorized_doctor_can_read() {
+fn test_get_records_by_ids_strict_missing_errors() {
     let env = Env::default();
-    let (client, patient, doctor) = setup_for_filter(&env);
+    let (client, patient, _doctor) = setup_for_get_records_by_ids(&env);
 
-    client.add_medical_record(
-        &patient,
-        &doctor,
-        &make_cid_v1(&env, 14),
-        &String::from_str(&env, "Flu shot"),
-        &Symbol::new(&env, "IMMUNIZATION"),
-    );
+    let mut ids = Vec::new(&env);
+    ids.push_back(1);
+    ids.push_back(999);
 
-    // Doctor (authorized) can query records
-    let records = client.get_records_by_type(&patient, &doctor, &Symbol::new(&env, "IMMUNIZATION"));
-    assert_eq!(records.len(), 1);
+    let result = client.try_get_records_by_ids(&patient, &patient, &ids, &true);
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_get_records_by_type_guardian_can_read() {
+fn test_get_records_by_ids_rejects_more_than_ten_ids() {
     let env = Env::default();
-    let (client, patient, doctor) = setup_for_filter(&env);
-    let guardian = Address::generate(&env);
+    let (client, patient, _doctor) = setup_for_get_records_by_ids(&env);
 
-    client.assign_guardian(&patient, &guardian);
-    client.add_medical_record(
-        &patient,
-        &doctor,
-        &make_cid_v1(&env, 15),
-        &String::from_str(&env, "Child checkup"),
-        &Symbol::new(&env, "VISIT"),
-    );
-
-    let records = client.get_records_by_type(&patient, &guardian, &Symbol::new(&env, "VISIT"));
-    assert_eq!(records.len(), 1);
-}
-
-#[test]
-#[should_panic(expected = "Caller not authorized to view records")]
-fn test_get_records_by_type_unauthorized_caller_is_rejected() {
-    let env = Env::default();
-    let (client, patient, _doctor) = setup_for_filter(&env);
-    let stranger = Address::generate(&env);
-
-    client.get_records_by_type(&patient, &stranger, &Symbol::new(&env, "LAB"));
-}
-
-#[test]
-fn test_get_records_by_type_multiple_types_isolation() {
-    let env = Env::default();
-    let (client, patient, doctor) = setup_for_filter(&env);
-
-    let types = [
-        ("LAB", "Blood work"),
-        ("PRESCRIPTION", "Metformin"),
-        ("IMAGING", "Chest X-ray"),
-        ("LAB", "Urinalysis"),
-        ("PRESCRIPTION", "Lisinopril"),
-    ];
-
-    for (i, (rtype, desc)) in types.iter().enumerate() {
-        client.add_medical_record(
-            &patient,
-            &doctor,
-            &make_cid_v1(&env, i as u8),
-            &String::from_str(&env, desc),
-            &Symbol::new(&env, rtype),
-        );
+    let mut ids = Vec::new(&env);
+    for i in 0u32..11u32 {
+        ids.push_back(i);
     }
 
-    assert_eq!(
-        client
-            .get_records_by_type(&patient, &patient, &Symbol::new(&env, "LAB"))
-            .len(),
-        2
-    );
-    assert_eq!(
-        client
-            .get_records_by_type(&patient, &patient, &Symbol::new(&env, "PRESCRIPTION"))
-            .len(),
-        2
-    );
-    assert_eq!(
-        client
-            .get_records_by_type(&patient, &patient, &Symbol::new(&env, "IMAGING"))
-            .len(),
-        1
-    );
-    assert_eq!(
-        client
-            .get_records_by_type(&patient, &patient, &Symbol::new(&env, "VISIT"))
-            .len(),
-        0
-    );
+    let result = client.try_get_records_by_ids(&patient, &patient, &ids, &false);
+    assert!(result.is_err());
 }
+
+#[test]
+fn test_get_records_by_ids_unauthorized_caller_rejected() {
+    let env = Env::default();
+    let (client, patient, _doctor) = setup_for_get_records_by_ids(&env);
+    let stranger = Address::generate(&env);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(0);
+    let result = client.try_get_records_by_ids(&patient, &stranger, &ids, &false);
+    assert!(result.is_err());
+}
+
+/// ------------------------------------------------
+/// PROVIDER-TO-PATIENT RECORD NOTIFICATION EVENT TESTS
+/// ------------------------------------------------
+
+#[test]
+fn test_new_record_event_emitted_on_add_record() {
+    let env = Env::default();
+    let (client, patient, doctor) = setup_for_filter(&env);
+
+    env.ledger().set_timestamp(1_700_000_000);
+
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 20),
+        &String::from_str(&env, "Blood panel"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    let events = env.events().all();
+    let new_record_topic = Symbol::new(&env, NEW_RECORD_TOPIC);
+
+    let mut found = false;
+    for (_contract_id, topics, data) in events.iter() {
+        let expected_topics_val: soroban_sdk::Vec<soroban_sdk::Val> = (
+            new_record_topic.clone(),
+            patient.clone(),
+            doctor.clone(),
+        )
+            .into_val(&env);
+        if topics == expected_topics_val {
+            let actual_data: (u64, Symbol, u64) = data.into_val(&env);
+            assert_eq!(
+                actual_data,
+                (1u64, Symbol::new(&env, "LAB"), 1_700_000_000u64)
+            );
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "new_record event not found in emitted events");
+}
+
+#[test]
+fn test_new_record_event_contains_correct_record_id() {
+    let env = Env::default();
+    let (client, patient, doctor) = setup_for_filter(&env);
+
+    env.ledger().set_timestamp(1_700_000_000);
+    let new_record_topic = Symbol::new(&env, NEW_RECORD_TOPIC);
+
+    // Add first record
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 21),
+        &String::from_str(&env, "First record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    let events1 = env.events().all();
+    let mut found_first = false;
+    for (_contract_id, topics, data) in events1.iter() {
+        let expected_topics_val: soroban_sdk::Vec<soroban_sdk::Val> =
+            (new_record_topic.clone(), patient.clone(), doctor.clone()).into_val(&env);
+        if topics == expected_topics_val {
+            let actual_data: (u64, Symbol, u64) = data.into_val(&env);
+            assert_eq!(
+                actual_data,
+                (1u64, Symbol::new(&env, "LAB"), 1_700_000_000u64)
+            );
+            found_first = true;
+        }
+    }
+    assert!(found_first, "First new_record event not found");
+
+    // Add second record
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 22),
+        &String::from_str(&env, "Second record"),
+        &Symbol::new(&env, "IMAGING"),
+    );
+
+    let events2 = env.events().all();
+    let mut found_second = false;
+    for (_contract_id, topics, data) in events2.iter() {
+        let expected_topics_val: soroban_sdk::Vec<soroban_sdk::Val> =
+            (new_record_topic.clone(), patient.clone(), doctor.clone()).into_val(&env);
+        if topics == expected_topics_val {
+            let actual_data: (u64, Symbol, u64) = data.into_val(&env);
+            assert_eq!(
+                actual_data,
+                (2u64, Symbol::new(&env, "IMAGING"), 1_700_000_000u64)
+            );
+            found_second = true;
+        }
+    }
+    assert!(found_second, "Second new_record event not found");
+}
+
+#[test]
+fn test_new_record_event_contains_correct_record_type() {
+    let env = Env::default();
+    let (client, patient, doctor) = setup_for_filter(&env);
+
+    env.ledger().set_timestamp(1_700_000_000);
+    let new_record_topic = Symbol::new(&env, NEW_RECORD_TOPIC);
+
+    // Add a LAB record
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 23),
+        &String::from_str(&env, "Lab test"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    let events1 = env.events().all();
+    let mut found_lab = false;
+    for (_contract_id, topics, data) in events1.iter() {
+        let expected_topics_val: soroban_sdk::Vec<soroban_sdk::Val> =
+            (new_record_topic.clone(), patient.clone(), doctor.clone()).into_val(&env);
+        if topics == expected_topics_val {
+            let actual_data: (u64, Symbol, u64) = data.into_val(&env);
+            if actual_data == (1u64, Symbol::new(&env, "LAB"), 1_700_000_000u64) {
+                found_lab = true;
+            }
+        }
+    }
+    assert!(found_lab, "LAB record event not found");
+
+    // Add an IMAGING record
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 24),
+        &String::from_str(&env, "X-ray"),
+        &Symbol::new(&env, "IMAGING"),
+    );
+
+    let events2 = env.events().all();
+    let mut found_imaging = false;
+    for (_contract_id, topics, data) in events2.iter() {
+        let expected_topics_val: soroban_sdk::Vec<soroban_sdk::Val> =
+            (new_record_topic.clone(), patient.clone(), doctor.clone()).into_val(&env);
+        if topics == expected_topics_val {
+            let actual_data: (u64, Symbol, u64) = data.into_val(&env);
+            if actual_data == (2u64, Symbol::new(&env, "IMAGING"), 1_700_000_000u64) {
+                found_imaging = true;
+            }
+        }
+    }
+    assert!(found_imaging, "IMAGING record event not found");
+}
+
+#[test]
+fn test_new_record_event_contains_correct_timestamp() {
+    let env = Env::default();
+    let (client, patient, doctor) = setup_for_filter(&env);
+
+    let specific_timestamp: u64 = 1_710_000_000;
+    env.ledger().set_timestamp(specific_timestamp);
+
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 25),
+        &String::from_str(&env, "Timed record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    let events = env.events().all();
+    let new_record_topic = Symbol::new(&env, NEW_RECORD_TOPIC);
+
+    let mut found = false;
+    for (_contract_id, topics, data) in events.iter() {
+        let expected_topics_val: soroban_sdk::Vec<soroban_sdk::Val> = (
+            new_record_topic.clone(),
+            patient.clone(),
+            doctor.clone(),
+        )
+            .into_val(&env);
+        if topics == expected_topics_val {
+            let actual_data: (u64, Symbol, u64) = data.into_val(&env);
+            assert_eq!(
+                actual_data,
+                (1u64, Symbol::new(&env, "LAB"), specific_timestamp),
+                "Event data must include the exact ledger timestamp"
+            );
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "new_record event with correct timestamp not found");
+}
+
+#[test]
+fn test_new_record_event_not_emitted_on_unauthorized_add() {
+    let env = Env::default();
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let patient = Address::generate(&env);
+    let unauthorized_doctor = Address::generate(&env);
+    let v1 = make_version(&env, 1);
+
+    env.mock_all_auths();
+    let treasury = Address::generate(&env);
+    let fee_token = Address::generate(&env);
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    // Intentionally do NOT grant access to unauthorized_doctor
+
+    let result = client.try_add_medical_record(
+        &patient,
+        &unauthorized_doctor,
+        &make_cid_v1(&env, 26),
+        &String::from_str(&env, "Should fail"),
+        &Symbol::new(&env, "LAB"),
+    );
+    assert!(result.is_err());
+
+    // Verify no new_record event was emitted
+    let events = env.events().all();
+    let new_record_topic = Symbol::new(&env, NEW_RECORD_TOPIC);
+    for (_contract_id, topics, _data) in events.iter() {
+        let nr_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
+            new_record_topic.clone(),
+            patient.clone(),
+            unauthorized_doctor.clone(),
+        )
+            .into_val(&env);
+        assert_ne!(
+            topics, nr_topics,
+            "new_record event should NOT be emitted when add_medical_record fails"
+        );
+    }
+}
+
 
 // =====================================================
 //                  CONTRACT FREEZE TESTS
@@ -2046,6 +2408,633 @@ fn test_non_admin_cannot_unfreeze() {
             },
         }])
         .try_unfreeze_contract();
+
+    assert!(result.is_err());
+}
+
+// ------------------------------------------------
+// SHARE LINK TESTS
+// ------------------------------------------------
+
+/// Helper: set up a contract with one patient, one doctor, one record, and return
+/// (env, client, contract_id, patient, doctor, record_hash).
+fn setup_with_record(
+    env: &Env,
+) -> (
+    soroban_sdk::Address,
+    soroban_sdk::Address,
+    soroban_sdk::Address,
+    MedicalRegistryClient<'_>,
+) {
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(env, &contract_id);
+
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    let fee_token = Address::generate(env);
+    let patient = Address::generate(env);
+    let doctor = Address::generate(env);
+    let v1 = BytesN::from_array(env, &[42u8; 32]);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(env, 1),
+        &String::from_str(env, "Blood test"),
+        &Symbol::new(env, "LAB"),
+    );
+
+    (admin, patient, doctor, client)
+}
+
+#[test]
+fn test_create_share_link_returns_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token = client
+        .create_share_link(&patient, &0u64, &1u32, &2000u64);
+
+    // Token is a 32-byte hash
+    assert_eq!(token.len(), 32);
+}
+
+#[test]
+fn test_single_use_link_works_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token = client
+        .create_share_link(&patient, &0u64, &1u32, &2000u64);
+
+    // First use succeeds
+    let record = client.use_share_link(&token);
+    assert_eq!(record.record_type, Symbol::new(&env, "LAB"));
+
+    // Second use fails — token exhausted
+    let result = client.try_use_share_link(&token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_multi_use_link_decrements_and_exhausts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token = client
+        .create_share_link(&patient, &0u64, &3u32, &9000u64);
+
+    // Three successful uses
+    for _ in 0..3 {
+        let record = client.use_share_link(&token);
+        assert_eq!(record.record_type, Symbol::new(&env, "LAB"));
+    }
+
+    // Fourth use fails
+    let result = client.try_use_share_link(&token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_expired_token_returns_invalid_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    // expires_at = 1500
+    let token = client
+        .create_share_link(&patient, &0u64, &5u32, &1500u64);
+
+    // Advance time past expiry
+    env.ledger().set_timestamp(1501);
+
+    let result = client.try_use_share_link(&token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_create_share_link_with_zero_uses_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let result = client.try_create_share_link(&patient, &0u64, &0u32, &2000u64);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_create_share_link_with_past_expiry_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(5000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    // expires_at is in the past
+    let result = client.try_create_share_link(&patient, &0u64, &1u32, &4999u64);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_create_share_link_invalid_record_id_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    // record_id 99 doesn't exist
+    let result = client.try_create_share_link(&patient, &99u64, &1u32, &2000u64);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_unknown_token_returns_invalid_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(&env, &contract_id);
+
+    let fake_token = BytesN::from_array(&env, &[0xdeu8; 32]);
+    let result = client.try_use_share_link(&fake_token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_two_links_for_same_record_are_independent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token_a = client
+        .create_share_link(&patient, &0u64, &1u32, &2000u64);
+    let token_b = client
+        .create_share_link(&patient, &0u64, &2u32, &2000u64);
+
+    // Tokens must differ (different nonces)
+    assert_ne!(token_a, token_b);
+
+    // Exhaust token_a
+    client.use_share_link(&token_a);
+    assert!(client.try_use_share_link(&token_a).is_err());
+
+    // token_b still has 2 uses
+    client.use_share_link(&token_b);
+    client.use_share_link(&token_b);
+    assert!(client.try_use_share_link(&token_b).is_err());
+}
+
+#[test]
+fn test_only_patient_can_create_share_link() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let fee_token = Address::generate(&env);
+    let patient = Address::generate(&env);
+    let doctor = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let v1 = BytesN::from_array(&env, &[1u8; 32]);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 1),
+        &String::from_str(&env, "Record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    // Attacker tries to create a link for the patient's record — auth will fail
+    // because patient.require_auth() won't be satisfied by attacker's signature.
+    // With mock_all_auths disabled we test real auth rejection.
+    let result = client
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "create_share_link",
+                args: (&patient, &0u64, &1u32, &2000u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_create_share_link(&patient, &0u64, &1u32, &2000u64);
+
+    assert!(result.is_err());
+}
+
+// ------------------------------------------------
+// SHARE LINK TESTS
+// ------------------------------------------------
+
+/// Helper: set up a contract with one patient, one doctor, one record, and return
+/// (env, client, contract_id, patient, doctor, record_hash).
+fn setup_with_record(
+    env: &Env,
+) -> (
+    soroban_sdk::Address,
+    soroban_sdk::Address,
+    soroban_sdk::Address,
+    MedicalRegistryClient<'_>,
+) {
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(env, &contract_id);
+
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    let fee_token = Address::generate(env);
+    let patient = Address::generate(env);
+    let doctor = Address::generate(env);
+    let v1 = BytesN::from_array(env, &[42u8; 32]);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(env, 1),
+        &String::from_str(env, "Blood test"),
+        &Symbol::new(env, "LAB"),
+    );
+
+    (admin, patient, doctor, client)
+}
+
+#[test]
+fn test_create_share_link_returns_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token = client
+        .create_share_link(&patient, &0u64, &1u32, &2000u64);
+
+    // Token is a 32-byte hash
+    assert_eq!(token.len(), 32);
+}
+
+#[test]
+fn test_single_use_link_works_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token = client
+        .create_share_link(&patient, &0u64, &1u32, &2000u64);
+
+    // First use succeeds
+    let record = client.use_share_link(&token);
+    assert_eq!(record.record_type, Symbol::new(&env, "LAB"));
+
+    // Second use fails — token exhausted
+    let result = client.try_use_share_link(&token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_multi_use_link_decrements_and_exhausts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token = client
+        .create_share_link(&patient, &0u64, &3u32, &9000u64);
+
+    // Three successful uses
+    for _ in 0..3 {
+        let record = client.use_share_link(&token);
+        assert_eq!(record.record_type, Symbol::new(&env, "LAB"));
+    }
+
+    // Fourth use fails
+    let result = client.try_use_share_link(&token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_expired_token_returns_invalid_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    // expires_at = 1500
+    let token = client
+        .create_share_link(&patient, &0u64, &5u32, &1500u64);
+
+    // Advance time past expiry
+    env.ledger().set_timestamp(1501);
+
+    let result = client.try_use_share_link(&token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_create_share_link_with_zero_uses_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let result = client.try_create_share_link(&patient, &0u64, &0u32, &2000u64);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_create_share_link_with_past_expiry_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(5000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    // expires_at is in the past
+    let result = client.try_create_share_link(&patient, &0u64, &1u32, &4999u64);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_create_share_link_invalid_record_id_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    // record_id 99 doesn't exist
+    let result = client.try_create_share_link(&patient, &99u64, &1u32, &2000u64);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_unknown_token_returns_invalid_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(&env, &contract_id);
+
+    let fake_token = BytesN::from_array(&env, &[0xdeu8; 32]);
+    let result = client.try_use_share_link(&fake_token);
+    assert!(matches!(result, Err(Ok(ContractError::InvalidToken))));
+}
+
+#[test]
+fn test_two_links_for_same_record_are_independent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let token_a = client
+        .create_share_link(&patient, &0u64, &1u32, &2000u64);
+    let token_b = client
+        .create_share_link(&patient, &0u64, &2u32, &2000u64);
+
+    // Tokens must differ (different nonces)
+    assert_ne!(token_a, token_b);
+
+    // Exhaust token_a
+    client.use_share_link(&token_a);
+    assert!(client.try_use_share_link(&token_a).is_err());
+
+    // token_b still has 2 uses
+    client.use_share_link(&token_b);
+    client.use_share_link(&token_b);
+    assert!(client.try_use_share_link(&token_b).is_err());
+}
+
+#[test]
+fn test_only_patient_can_create_share_link() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let fee_token = Address::generate(&env);
+    let patient = Address::generate(&env);
+    let doctor = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let v1 = BytesN::from_array(&env, &[1u8; 32]);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.grant_access(&patient, &patient, &doctor);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 1),
+        &String::from_str(&env, "Record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    // Attacker tries to create a link for the patient's record — auth will fail
+    // because patient.require_auth() won't be satisfied by attacker's signature.
+    // With mock_all_auths disabled we test real auth rejection.
+    let result = client
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "create_share_link",
+                args: (&patient, &0u64, &1u32, &2000u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_create_share_link(&patient, &0u64, &1u32, &2000u64);
+
+    assert!(result.is_err());
+}
+
+// ------------------------------------------------
+// DEREGISTRATION TESTS
+// ------------------------------------------------
+
+fn setup_for_dereg(
+    env: &Env,
+) -> (MedicalRegistryClient<'_>, Address, Address, Address) {
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    let fee_token = Address::generate(env);
+    let patient = Address::generate(env);
+    let doctor = Address::generate(env);
+    let v1 = BytesN::from_array(env, &[55u8; 32]);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.acknowledge_consent(&patient, &patient, &v1);
+    client.register_patient(
+        &patient,
+        &String::from_str(env, "Alice"),
+        &631152000,
+        &String::from_str(env, "ipfs://alice"),
+    );
+    client.grant_access(&patient, &patient, &doctor);
+
+    (client, admin, patient, doctor)
+}
+
+#[test]
+fn test_deregister_sets_status() {
+    let env = Env::default();
+    let (client, _admin, patient, _doctor) = setup_for_dereg(&env);
+
+    client.deregister_patient(&patient);
+
+    let data = client.get_patient(&patient);
+    assert_eq!(data.status, PatientStatus::Deregistered);
+}
+
+#[test]
+fn test_deregister_revokes_all_access_grants() {
+    let env = Env::default();
+    let (client, _admin, patient, _doctor) = setup_for_dereg(&env);
+
+    assert_eq!(client.get_authorized_doctors(&patient).len(), 1);
+
+    client.deregister_patient(&patient);
+
+    assert_eq!(client.get_authorized_doctors(&patient).len(), 0);
+}
+
+#[test]
+fn test_deregister_records_retained_admin_can_read() {
+    let env = Env::default();
+    let (client, admin, patient, doctor) = setup_for_dereg(&env);
+
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 20),
+        &String::from_str(&env, "Pre-dereg record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    client.deregister_patient(&patient);
+
+    // Admin can still read records
+    let records = client.get_medical_records(&patient, &admin);
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Records only accessible by admin after deregistration")]
+fn test_deregister_blocks_grantee_read() {
+    let env = Env::default();
+    let (client, _admin, patient, doctor) = setup_for_dereg(&env);
+
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 21),
+        &String::from_str(&env, "Record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    client.deregister_patient(&patient);
+
+    // Former grantee (doctor) can no longer read
+    client.get_medical_records(&patient, &doctor);
+}
+
+#[test]
+#[should_panic(expected = "Patient already deregistered")]
+fn test_double_deregister_panics() {
+    let env = Env::default();
+    let (client, _admin, patient, _doctor) = setup_for_dereg(&env);
+
+    client.deregister_patient(&patient);
+    client.deregister_patient(&patient);
+}
+
+#[test]
+fn test_deregister_patient_only() {
+    let env = Env::default();
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let fee_token = Address::generate(&env);
+    let patient = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let v1 = BytesN::from_array(&env, &[1u8; 32]);
+
+    env.mock_all_auths();
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.register_patient(
+        &patient,
+        &String::from_str(&env, "Bob"),
+        &631152000,
+        &String::from_str(&env, "ipfs://bob"),
+    );
+
+    let result = client
+        .mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "deregister_patient",
+                args: (&patient,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_deregister_patient(&patient);
 
     assert!(result.is_err());
 }
