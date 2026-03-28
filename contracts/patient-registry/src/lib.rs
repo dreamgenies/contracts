@@ -93,16 +93,18 @@ pub enum DataKey {
     ShareLink(BytesN<32>),
     /// Marks a patient as deregistered (value: timestamp of deregistration).
     Deregistered(Address),
-    /// Global record ID counter (instance storage).
-    RecordCounter,
-    /// Contract frozen flag (instance storage).
+    /// Contract-frozen flag (bool).
     Frozen,
-    /// Ordered list of record IDs belonging to a patient (persistent).
+    /// Global monotonic record counter (u64, instance storage).
+    RecordCounter,
+    /// Per-patient ordered list of record IDs (Vec<u64>).
     PatientRecordIds(Address),
-    /// Individual medical record keyed by global record ID (persistent).
+    /// Individual record data keyed by global record ID.
     MedicalRecord(u64),
-    /// Merkle root of the patient's record-ID set (persistent).
-    MerkleRoot(Address),
+    /// Platform-wide secondary index: record_type → Vec<TypeIndexEntry>.
+    GlobalTypeIndex(Symbol),
+    /// Soft-delete tombstone for a record (value: timestamp of deletion).
+    DeletedRecord(u64),
 }
 
 /// --------------------
@@ -115,6 +117,15 @@ pub struct ShareLinkData {
     pub record_id: u64,
     pub uses_remaining: u32,
     pub expires_at: u64,
+}
+
+/// One entry in the platform-wide secondary index.
+/// Maps a `record_type` to the patient who owns it and the global record ID.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeIndexEntry {
+    pub patient: Address,
+    pub record_id: u64,
 }
 
 #[contracttype]
@@ -829,7 +840,7 @@ impl MedicalRegistry {
 
         let timestamp = env.ledger().timestamp();
 
-        // Get next record ID
+        // Advance global monotonic record counter (instance storage).
         let mut record_id: u64 = env
             .storage()
             .instance()
@@ -849,7 +860,7 @@ impl MedicalRegistry {
         let record_data = RecordData {
             patient: patient.clone(),
             record_type: record_type.clone(),
-            description: description.clone(),
+            description,
             current_ipfs: record_hash.clone(),
             history: {
                 let mut h = Vec::new(&env);
@@ -859,20 +870,12 @@ impl MedicalRegistry {
             latest_version: 1u64,
         };
 
-        let record_id: u64 = env
-            .storage()
-            .instance()
-            .get::<DataKey, u64>(&DataKey::RecordCounter)
-            .unwrap_or(0u64)
-            + 1;
-        env.storage().instance().set(&DataKey::RecordCounter, &record_id);
-
         // Store record data (using cloned values)
         env.storage()
             .persistent()
             .set(&DataKey::MedicalRecord(record_id), &record_data);
 
-        // Append to patient's record IDs
+        // Append to patient's ordered record-ID list.
         let ids_key = DataKey::PatientRecordIds(patient.clone());
         let mut ids: Vec<u64> = env
             .storage()
@@ -882,10 +885,27 @@ impl MedicalRegistry {
         ids.push_back(record_id);
         env.storage().persistent().set(&ids_key, &ids);
 
-        // Recompute and persist Merkle root
-        Self::update_merkle_root(&env, &patient, &ids);
+        // ── Secondary index update ────────────────────────────────────────────
+        // Atomically append (patient, record_id) to the global type index.
+        let idx_key = DataKey::GlobalTypeIndex(record_type.clone());
+        let mut type_index: Vec<TypeIndexEntry> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or(Vec::new(&env));
+        type_index.push_back(TypeIndexEntry {
+            patient: patient.clone(),
+            record_id,
+        });
+        env.storage().persistent().set(&idx_key, &type_index);
+        env.storage().persistent().extend_ttl(
+            &idx_key,
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP_AMOUNT,
+        );
+        // ─────────────────────────────────────────────────────────────────────
 
-        // TTL bump
+        // TTL bumps for per-patient and per-record keys.
         Self::bump_patient_keys(&env, &patient);
         env.storage().persistent().extend_ttl(
             &DataKey::MedicalRecord(record_id),
@@ -896,22 +916,9 @@ impl MedicalRegistry {
             .persistent()
             .extend_ttl(&ids_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
 
-        // Emit new-record event
         env.events().publish(
-            (
-                Symbol::new(&env, NEW_RECORD_TOPIC),
-                patient.clone(),
-                doctor.clone(),
-            ),
-            (record_id, record_type.clone(), timestamp),
-        );
-
-        // Extend TTL for all patient persistent entries after writing a record
-        Self::bump_patient_keys(&env, &patient);
-
-        env.events().publish(
-            (symbol_short!("rec_add"), record_id),
-            (patient, doctor),
+            (Symbol::new(&env, NEW_RECORD_TOPIC), patient.clone(), doctor.clone()),
+            (record_id, record_type, timestamp),
         );
 
         Ok(record_id)
@@ -1327,40 +1334,116 @@ impl MedicalRegistry {
     }
 
     // =====================================================
-    //              MERKLE PROOF SUPPORT
+    //           GLOBAL SECONDARY INDEX (ADMIN)
     // =====================================================
 
-    /// Returns the current Merkle root over `patient`'s record IDs.
+    /// Soft-delete a record: marks it as deleted and atomically removes it from
+    /// the global type index.
     ///
-    /// Returns `sha256("")` (all-zero-ish hash of empty input) when the patient
-    /// has no records yet.
-    pub fn get_merkle_root(env: Env, patient: Address) -> BytesN<32> {
-        env.storage()
+    /// Callable by the owning patient, their guardian, or an authorized doctor.
+    /// After deletion the record data is retained for audit purposes but will no
+    /// longer appear in index queries.
+    pub fn soft_delete_record(env: Env, record_id: u64, caller: Address) -> Result<(), ContractError> {
+        Self::require_not_frozen(&env);
+
+        let record_key = DataKey::MedicalRecord(record_id);
+        let record_data: RecordData = env
+            .storage()
             .persistent()
-            .get(&DataKey::MerkleRoot(patient))
-            .unwrap_or_else(|| {
-                // Empty-set sentinel: sha256 of empty bytes
-                merkle::compute_merkle_root(&env, &Vec::new(&env))
-            })
+            .get(&record_key)
+            .ok_or(ContractError::NotFound)?;
+
+        let patient = record_data.patient.clone();
+        Self::require_patient_exists(&env, &patient);
+        require_record_access(&env, &patient, &caller);
+
+        // Guard: already deleted?
+        if env.storage().persistent().has(&DataKey::DeletedRecord(record_id)) {
+            panic!("Record already deleted");
+        }
+
+        // Stamp the tombstone.
+        env.storage().persistent().set(
+            &DataKey::DeletedRecord(record_id),
+            &env.ledger().timestamp(),
+        );
+
+        // ── Secondary index update ────────────────────────────────────────────
+        // Remove this entry from the global type index atomically.
+        let idx_key = DataKey::GlobalTypeIndex(record_data.record_type.clone());
+        let mut type_index: Vec<TypeIndexEntry> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut updated = Vec::new(&env);
+        for entry in type_index.iter() {
+            if entry.record_id != record_id {
+                updated.push_back(entry);
+            }
+        }
+        env.storage().persistent().set(&idx_key, &updated);
+        env.storage().persistent().extend_ttl(
+            &idx_key,
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP_AMOUNT,
+        );
+        // ─────────────────────────────────────────────────────────────────────
+
+        env.events().publish(
+            (symbol_short!("rec_del"), patient),
+            (record_id, env.ledger().timestamp()),
+        );
+
+        Ok(())
     }
 
-    /// Verify that `record_id` is a member of `patient`'s Merkle tree.
+    /// Returns every (patient, record_id) pair indexed under `record_type`.
     ///
-    /// `proof` is the ordered list of sibling hashes from the leaf up to (but
-    /// not including) the root.  Because children are sorted before hashing,
-    /// no position bits are needed.
-    pub fn verify_record_membership(
+    /// **Admin-only.** Non-admins receive `NotAuthorized`.
+    pub fn get_global_records_by_type(
         env: Env,
-        patient: Address,
-        record_id: u64,
-        proof: Vec<BytesN<32>>,
-    ) -> bool {
-        let root_key = DataKey::MerkleRoot(patient);
-        let root: BytesN<32> = match env.storage().persistent().get(&root_key) {
-            Some(r) => r,
-            None => return false,
-        };
-        merkle::verify_membership(&env, record_id, &proof, &root)
+        record_type: Symbol,
+    ) -> Result<Vec<TypeIndexEntry>, ContractError> {
+        Self::require_admin(&env);
+
+        let idx_key = DataKey::GlobalTypeIndex(record_type);
+        let index: Vec<TypeIndexEntry> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or(Vec::new(&env));
+
+        if env.storage().persistent().has(&idx_key) {
+            env.storage().persistent().extend_ttl(
+                &idx_key,
+                LEDGER_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
+        }
+
+        Ok(index)
+    }
+
+    /// Returns the count of active (non-deleted) records of the given type
+    /// across all patients.
+    ///
+    /// **Admin-only.** Non-admins receive `NotAuthorized`.
+    pub fn get_global_type_count(
+        env: Env,
+        record_type: Symbol,
+    ) -> Result<u64, ContractError> {
+        Self::require_admin(&env);
+
+        let idx_key = DataKey::GlobalTypeIndex(record_type);
+        let index: Vec<TypeIndexEntry> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or(Vec::new(&env));
+
+        Ok(index.len() as u64)
     }
 
     // =====================================================
