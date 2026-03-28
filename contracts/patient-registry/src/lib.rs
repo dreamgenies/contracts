@@ -2,11 +2,12 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, Map, String, Symbol, Vec, panic_with_error,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
 };
 
 pub mod validation;
+pub mod merkle;
 pub const NEW_RECORD_TOPIC: &str = "new_record";
 
 // =====================================================
@@ -92,14 +93,16 @@ pub enum DataKey {
     ShareLink(BytesN<32>),
     /// Marks a patient as deregistered (value: timestamp of deregistration).
     Deregistered(Address),
-    /// Frozen flag
-    Frozen,
-    /// Global record counter
+    /// Global record ID counter (instance storage).
     RecordCounter,
-    /// Patient's record IDs
+    /// Contract frozen flag (instance storage).
+    Frozen,
+    /// Ordered list of record IDs belonging to a patient (persistent).
     PatientRecordIds(Address),
-    /// Medical record by ID
+    /// Individual medical record keyed by global record ID (persistent).
     MedicalRecord(u64),
+    /// Merkle root of the patient's record-ID set (persistent).
+    MerkleRoot(Address),
 }
 
 /// --------------------
@@ -879,6 +882,9 @@ impl MedicalRegistry {
         ids.push_back(record_id);
         env.storage().persistent().set(&ids_key, &ids);
 
+        // Recompute and persist Merkle root
+        Self::update_merkle_root(&env, &patient, &ids);
+
         // TTL bump
         Self::bump_patient_keys(&env, &patient);
         env.storage().persistent().extend_ttl(
@@ -889,7 +895,8 @@ impl MedicalRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&ids_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
-        // Emit provider-to-patient record notification
+
+        // Emit new-record event
         env.events().publish(
             (
                 Symbol::new(&env, NEW_RECORD_TOPIC),
@@ -957,6 +964,7 @@ impl MedicalRegistry {
     /// Returns an empty vec (not an error) when no records match.
     pub fn update_record(
         env: Env,
+        caller: Address,
         record_id: u64,
         caller: Address,
         new_ipfs_hash: Bytes,
@@ -1319,6 +1327,43 @@ impl MedicalRegistry {
     }
 
     // =====================================================
+    //              MERKLE PROOF SUPPORT
+    // =====================================================
+
+    /// Returns the current Merkle root over `patient`'s record IDs.
+    ///
+    /// Returns `sha256("")` (all-zero-ish hash of empty input) when the patient
+    /// has no records yet.
+    pub fn get_merkle_root(env: Env, patient: Address) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerkleRoot(patient))
+            .unwrap_or_else(|| {
+                // Empty-set sentinel: sha256 of empty bytes
+                merkle::compute_merkle_root(&env, &Vec::new(&env))
+            })
+    }
+
+    /// Verify that `record_id` is a member of `patient`'s Merkle tree.
+    ///
+    /// `proof` is the ordered list of sibling hashes from the leaf up to (but
+    /// not including) the root.  Because children are sorted before hashing,
+    /// no position bits are needed.
+    pub fn verify_record_membership(
+        env: Env,
+        patient: Address,
+        record_id: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        let root_key = DataKey::MerkleRoot(patient);
+        let root: BytesN<32> = match env.storage().persistent().get(&root_key) {
+            Some(r) => r,
+            None => return false,
+        };
+        merkle::verify_membership(&env, record_id, &proof, &root)
+    }
+
+    // =====================================================
     //                  PRIVATE HELPERS
     // =====================================================
 
@@ -1372,14 +1417,28 @@ impl MedicalRegistry {
         }
     }
 
+    /// Recompute and persist the Merkle root for `patient` from their current
+    /// record-ID list.  Called by `add_medical_record` after every insertion.
+    fn update_merkle_root(env: &Env, patient: &Address, ids: &Vec<u64>) {
+        let root = merkle::compute_merkle_root(env, ids);
+        let root_key = DataKey::MerkleRoot(patient.clone());
+        env.storage().persistent().set(&root_key, &root);
+        env.storage().persistent().extend_ttl(
+            &root_key,
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP_AMOUNT,
+        );
+    }
+
     /// Bump TTL for all critical persistent keys belonging to a patient.
     fn bump_patient_keys(env: &Env, patient: &Address) {
-        let keys: [DataKey; 5] = [
+        let keys: [DataKey; 6] = [
             DataKey::Patient(patient.clone()),
             DataKey::MedicalRecords(patient.clone()),
             DataKey::AuthorizedDoctors(patient.clone()),
             DataKey::PatientRecordIds(patient.clone()),
             DataKey::ConsentAck(patient.clone()),
+            DataKey::MerkleRoot(patient.clone()),
         ];
         for key in keys.iter() {
             if env.storage().persistent().has(key) {
