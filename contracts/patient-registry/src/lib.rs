@@ -108,6 +108,8 @@ pub enum DataKey {
     GlobalTypeIndex(Symbol),
     /// Soft-delete tombstone for a record (value: timestamp of deletion).
     DeletedRecord(u64),
+    /// Merkle root for a patient's records.
+    MerkleRoot(Address),
 }
 
 /// --------------------
@@ -177,10 +179,11 @@ pub enum ContractError {
     InvalidCID = 1,
     InvalidToken = 2,
     NotAuthorized = 3,
-    InvalidDID = 2,
-    InvalidScore = 3,
-    ContractFrozen = 2,
-    NoRecordsFound = 4,
+    InvalidDID = 4,
+    InvalidScore = 5,
+    ContractFrozen = 6,
+    NoRecordsFound = 7,
+    NotFound = 8,
 }
 
 pub fn validate_cid(cid: &Bytes) -> Result<(), ContractError> {
@@ -799,7 +802,7 @@ impl MedicalRegistry {
             .storage()
             .persistent()
             .get(&key)
-            .unwrapOr(Map::new(&env));
+            .unwrap_or(Map::new(&env));
 
         if !map.contains_key(doctor.clone()) {
             let total_access_grants: u64 = env
@@ -931,7 +934,7 @@ impl MedicalRegistry {
         let record_data = RecordData {
             patient: patient.clone(),
             record_type: record_type.clone(),
-            description,
+            description: description.clone(),
             current_ipfs: record_hash.clone(),
             history: {
                 let mut h = Vec::new(&env);
@@ -941,7 +944,7 @@ impl MedicalRegistry {
             latest_version: 1u64,
         };
 
-        let counter_key = DataKey::RecordCounter(patient.clone());
+        let counter_key = DataKey::RecordCounter;
         let record_id: u64 = env
             .storage()
             .persistent()
@@ -1146,7 +1149,6 @@ impl MedicalRegistry {
         env: Env,
         caller: Address,
         record_id: u64,
-        caller: Address,
         new_ipfs_hash: Bytes,
     ) -> Result<(), ContractError> {
         Self::require_not_frozen(&env);
