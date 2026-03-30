@@ -2914,6 +2914,53 @@ fn test_only_patient_can_create_share_link() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_request_data_export_returns_valid_ticket() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let ticket = client.request_data_export(&patient);
+
+    assert_eq!(ticket.patient, patient);
+    assert_eq!(ticket.issued_at, 10_000);
+    assert_eq!(ticket.expires_at, 13_600);
+    assert!(client.validate_export_ticket(&ticket));
+}
+
+#[test]
+fn test_validate_export_ticket_rejects_expired_ticket() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(20_000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let ticket = client.request_data_export(&patient);
+    env.ledger().set_timestamp(ticket.expires_at + 1);
+
+    assert!(!client.validate_export_ticket(&ticket));
+}
+
+#[test]
+fn test_validate_export_ticket_rejects_tampered_ticket() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(30_000);
+
+    let (_admin, patient, _doctor, client) = setup_with_record(&env);
+
+    let ticket = client.request_data_export(&patient);
+    let tampered = ExportTicket {
+        signature: BytesN::from_array(&env, &[0xabu8; 32]),
+        ..ticket
+    };
+
+    assert!(!client.validate_export_ticket(&tampered));
+}
+
 // ------------------------------------------------
 // DEREGISTRATION TESTS
 // ------------------------------------------------

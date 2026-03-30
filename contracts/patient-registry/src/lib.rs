@@ -92,6 +92,8 @@ pub enum DataKey {
     TotalAccessGrants,
     /// Nonce counter per patient for share-link token generation.
     ShareNonce(Address),
+    /// Nonce counter per patient for data export ticket generation.
+    ExportNonce(Address),
     /// Share link data keyed by token hash.
     ShareLink(BytesN<32>),
     /// Marks a patient as deregistered (value: timestamp of deregistration).
@@ -125,6 +127,16 @@ pub struct ShareLinkData {
     pub record_id: u64,
     pub uses_remaining: u32,
     pub expires_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportTicket {
+    pub patient: Address,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub nonce: BytesN<32>,
+    pub signature: BytesN<32>,
 }
 
 /// One entry in the platform-wide secondary index.
@@ -245,6 +257,35 @@ fn require_patient_or_guardian(env: &Env, patient: &Address, caller: &Address) {
     } else {
         panic!("Caller is not patient or assigned guardian");
     }
+}
+
+fn next_export_nonce(env: &Env, patient: &Address, issued_at: u64) -> BytesN<32> {
+    let nonce_key = DataKey::ExportNonce(patient.clone());
+    let nonce_counter: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0u64) + 1;
+    env.storage().persistent().set(&nonce_key, &nonce_counter);
+
+    let mut preimage = Bytes::new(env);
+    preimage.append(&patient.clone().to_xdr(env));
+    preimage.extend_from_array(&issued_at.to_be_bytes());
+    preimage.extend_from_array(&nonce_counter.to_be_bytes());
+
+    env.crypto().sha256(&preimage)
+}
+
+fn sign_export_ticket(
+    env: &Env,
+    patient: &Address,
+    issued_at: u64,
+    expires_at: u64,
+    nonce: &BytesN<32>,
+) -> BytesN<32> {
+    let mut payload = Bytes::new(env);
+    payload.append(&patient.clone().to_xdr(env));
+    payload.extend_from_array(&issued_at.to_be_bytes());
+    payload.extend_from_array(&expires_at.to_be_bytes());
+    payload.append(&Bytes::from(nonce.clone()));
+
+    env.crypto().sha256(&payload)
 }
 
 /// Enforces that `caller` is the patient, their guardian, or an authorized doctor.
@@ -1697,6 +1738,41 @@ impl MedicalRegistry {
         );
 
         Ok(record)
+    }
+
+    /// Create a one-hour export authorization ticket for a patient's data.
+    pub fn request_data_export(env: Env, patient: Address) -> ExportTicket {
+        patient.require_auth();
+
+        let issued_at = env.ledger().timestamp();
+        let expires_at = issued_at.saturating_add(3600);
+        let nonce = next_export_nonce(&env, &patient, issued_at);
+        let signature = sign_export_ticket(&env, &patient, issued_at, expires_at, &nonce);
+
+        ExportTicket {
+            patient,
+            issued_at,
+            expires_at,
+            nonce,
+            signature,
+        }
+    }
+
+    /// Validate a patient data export ticket for expiry and integrity.
+    pub fn validate_export_ticket(env: Env, ticket: ExportTicket) -> bool {
+        if env.ledger().timestamp() > ticket.expires_at {
+            return false;
+        }
+
+        let expected_signature = sign_export_ticket(
+            &env,
+            &ticket.patient,
+            ticket.issued_at,
+            ticket.expires_at,
+            &ticket.nonce,
+        );
+
+        expected_signature == ticket.signature
     }
 
     // =====================================================
