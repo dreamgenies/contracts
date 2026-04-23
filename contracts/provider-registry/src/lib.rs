@@ -2,8 +2,8 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Env, String,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, vec,
+    Address, Env, String, Vec,
 };
 
 mod test;
@@ -15,6 +15,9 @@ pub enum ContractError {
     RateLimitExceeded = 1,
     InvalidScore = 2,
     AlreadyRated = 3,
+    Unauthorized = 4,
+    NotFound = 5,
+    AlreadyInitialized = 6,
 }
 
 #[contracttype]
@@ -65,12 +68,13 @@ pub struct ProviderRegistry;
 #[contractimpl]
 impl ProviderRegistry {
     /// Initialize the contract with an admin address.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         if env.storage().persistent().has(&DataKey::Admin) {
-            panic!("Already initialized");
+            return Err(ContractError::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        Ok(())
     }
 
     /// Configure rolling per-provider rate limit for `add_record`. Admin only.
@@ -123,7 +127,7 @@ impl ProviderRegistry {
     ) -> Result<(), ContractError> {
         provider.require_auth();
         if !Self::is_provider(env.clone(), provider.clone()) {
-            panic!("Unauthorized: not a whitelisted provider");
+            return Err(ContractError::Unauthorized);
         }
         Self::consume_provider_rate_slot(&env, &provider)?;
 
@@ -157,11 +161,11 @@ impl ProviderRegistry {
     }
 
     /// Retrieve a medical record by ID.
-    pub fn get_record(env: Env, record_id: String) -> Record {
+    pub fn get_record(env: Env, record_id: String) -> Result<Record, ContractError> {
         env.storage()
             .persistent()
             .get(&DataKey::Record(record_id))
-            .expect("Record not found")
+            .ok_or(ContractError::NotFound)
     }
 
     /// Retrieve the total number of records ever created by a provider.
@@ -186,7 +190,7 @@ impl ProviderRegistry {
             return Err(ContractError::InvalidScore);
         }
         if !Self::is_provider(env.clone(), provider.clone()) {
-            panic!("Provider not found");
+            return Err(ContractError::NotFound);
         }
 
         let patient_rating_key = DataKey::ProviderRatingByPatient(provider.clone(), patient);
@@ -293,9 +297,9 @@ impl ProviderRegistry {
             .storage()
             .persistent()
             .get(&DataKey::Admin)
-            .expect("Not initialized");
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NotFound));
         if *caller != admin {
-            panic!("Unauthorized: admin only");
+            panic_with_error!(env, ContractError::Unauthorized);
         }
     }
 
