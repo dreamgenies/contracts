@@ -202,7 +202,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital not found"));
 
             .ok_or(ContractError::HospitalNotFound)?;
 
@@ -230,7 +229,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital not found"))
 
             .ok_or(ContractError::HospitalNotFound)
 
@@ -255,7 +253,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"))
 
             .ok_or(ContractError::HospitalConfigNotFound)
 
@@ -271,7 +268,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
@@ -296,7 +292,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
@@ -319,7 +314,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
@@ -342,7 +336,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
@@ -365,7 +358,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
@@ -394,7 +386,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
@@ -417,7 +408,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
@@ -446,7 +436,6 @@ impl HospitalRegistry {
             .persistent()
             .get(&key)
 
-            .unwrap_or_else(|| panic!("Hospital config not found"));
 
             .ok_or(ContractError::HospitalConfigNotFound)?;
 
