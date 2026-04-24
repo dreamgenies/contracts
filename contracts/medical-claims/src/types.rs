@@ -8,6 +8,8 @@ pub enum Error {
     ClaimNotFound = 2,
     InvalidAppealLevel = 3,
     InvalidStateTransition = 4,
+    InvalidAmount = 5,
+    AmountOverflow = 6,
 }
 
 #[contracttype]
@@ -18,6 +20,14 @@ pub enum ClaimStatus {
     Appealed,
     Paid,
     Closed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReconciliationStatus {
+    Unreconciled,
+    PartiallyReconciled,
+    Reconciled,
 }
 
 #[contracttype]
@@ -41,6 +51,21 @@ pub struct DenialInfo {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsurerPaymentRecord {
+    pub payment_date: u64,
+    pub payment_amount: i128,
+    pub payment_reference: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PatientPaymentRecord {
+    pub payment_date: u64,
+    pub payment_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimRecord {
     pub claim_id: u64,
     pub provider_id: Address,
@@ -55,17 +80,20 @@ pub struct ClaimRecord {
     pub approved_amount: Option<i128>,
     pub patient_responsibility: Option<i128>,
     pub appeal_level: u32,
+    pub insurer_paid_amount: i128,
+    pub patient_paid_amount: i128,
+    pub reconciliation_status: ReconciliationStatus,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     ClaimCounter,
-    Claim(u64),              // claim_id -> ClaimRecord
-    DenialInfos(u64),        // claim_id -> Vec<DenialInfo>
-    ApprovedLines(u64),      // claim_id -> Vec<u64>
-    ProviderClaims(Address), // provider_id -> Vec<u64>
-    PatientClaims(Address),  // patient_id -> Vec<u64>
-    ClaimPayment(u64),       // claim_id -> (u64, String) // payment_date, payment_reference
-    PatientPayment(u64),     // claim_id -> (u64, i128) // payment_date, payment_amount
+    Claim(u64),
+    DenialInfos(u64),
+    ApprovedLines(u64),
+    ProviderClaims(Address),
+    PatientClaims(Address),
+    ClaimPayment(u64),
+    PatientPayment(u64),
 }
