@@ -3,7 +3,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, vec,
-    Address, Env, String, Vec,
+    Address, BytesN, Env, String, Vec,
 };
 
 mod test;
@@ -18,6 +18,9 @@ pub enum ContractError {
     Unauthorized = 4,
     NotFound = 5,
     AlreadyInitialized = 6,
+    InvalidCredential = 7,
+    CredentialExpired = 8,
+    CredentialRevoked = 9,
 }
 
 #[contracttype]
@@ -34,7 +37,26 @@ pub struct ProviderRateWindow {
     pub window_start: u64,
 }
 
-/// A stored medical record with its creator tracked for ownership transfer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialAnchor {
+    pub credential_hash: BytesN<32>,
+    pub issuer: Address,
+    pub attestation_hash: BytesN<32>,
+    pub expires_at: u64,
+    pub revocation_reference: BytesN<32>,
+    pub revoked_at: Option<u64>,
+    pub revoked_by: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderProfile {
+    pub credential: CredentialAnchor,
+    pub active: bool,
+    pub registered_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Record {
@@ -59,7 +81,7 @@ pub enum DataKey {
     RateLimitConfig,
     ProviderRate(Address),
     ProviderReputation(Address),
-    ProviderRatingByPatient(Address, Address), // (provider, patient)
+    ProviderRatingByPatient(Address, Address),
 }
 
 #[contract]
@@ -67,7 +89,6 @@ pub struct ProviderRegistry;
 
 #[contractimpl]
 impl ProviderRegistry {
-    /// Initialize the contract with an admin address.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(ContractError::AlreadyInitialized);
@@ -77,8 +98,6 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Configure rolling per-provider rate limit for `add_record`. Admin only.
-    /// Use `max_records = 0` or `window_seconds = 0` to disable limiting.
     pub fn set_rate_limit(env: Env, admin: Address, max_records: u32, window_seconds: u64) {
         Self::assert_admin(&env, &admin);
         env.storage().instance().set(
@@ -90,35 +109,77 @@ impl ProviderRegistry {
         );
     }
 
-    /// Whitelist a provider address. Admin only.
-    pub fn register_provider(env: Env, admin: Address, provider: Address) {
+    pub fn register_provider(
+        env: Env,
+        admin: Address,
+        provider: Address,
+        issuer: Address,
+        credential_hash: BytesN<32>,
+        attestation_hash: BytesN<32>,
+        expires_at: u64,
+        revocation_reference: BytesN<32>,
+    ) -> Result<(), ContractError> {
         Self::assert_admin(&env, &admin);
+        provider.require_auth();
+        issuer.require_auth();
+        Self::assert_future_expiry(&env, expires_at)?;
+
+        let profile = ProviderProfile {
+            credential: CredentialAnchor {
+                credential_hash,
+                issuer,
+                attestation_hash,
+                expires_at,
+                revocation_reference,
+                revoked_at: None,
+                revoked_by: None,
+            },
+            active: true,
+            registered_at: env.ledger().timestamp(),
+        };
+
         env.storage()
             .persistent()
-            .set(&DataKey::Provider(provider.clone()), &true);
+            .set(&DataKey::Provider(provider.clone()), &profile);
         env.events()
             .publish((symbol_short!("reg_prov"), provider), symbol_short!("ok"));
+        Ok(())
     }
 
-    /// Remove a provider from the whitelist. Admin only.
-    pub fn revoke_provider(env: Env, admin: Address, provider: Address) {
+    pub fn revoke_provider(env: Env, admin: Address, provider: Address) -> Result<(), ContractError> {
         Self::assert_admin(&env, &admin);
-        env.storage()
+
+        let key = DataKey::Provider(provider.clone());
+        let mut profile: ProviderProfile = env
+            .storage()
             .persistent()
-            .remove(&DataKey::Provider(provider.clone()));
+            .get(&key)
+            .ok_or(ContractError::NotFound)?;
+
+        profile.active = false;
+        profile.credential.revoked_at = Some(env.ledger().timestamp());
+        profile.credential.revoked_by = Some(admin.clone());
+        env.storage().persistent().set(&key, &profile);
+
         env.events()
             .publish((symbol_short!("rev_prov"), provider), symbol_short!("ok"));
+        Ok(())
     }
 
-    /// Returns true if the address is a whitelisted provider.
     pub fn is_provider(env: Env, provider: Address) -> bool {
+        Self::provider_is_active(&env, &provider)
+    }
+
+    pub fn get_provider_profile(
+        env: Env,
+        provider: Address,
+    ) -> Result<ProviderProfile, ContractError> {
         env.storage()
             .persistent()
             .get(&DataKey::Provider(provider))
-            .unwrap_or(false)
+            .ok_or(ContractError::NotFound)
     }
 
-    /// Add a medical record. Caller must be a whitelisted provider.
     pub fn add_record(
         env: Env,
         provider: Address,
@@ -126,9 +187,7 @@ impl ProviderRegistry {
         data: String,
     ) -> Result<(), ContractError> {
         provider.require_auth();
-        if !Self::is_provider(env.clone(), provider.clone()) {
-            return Err(ContractError::Unauthorized);
-        }
+        Self::load_active_provider(&env, &provider)?;
         Self::consume_provider_rate_slot(&env, &provider)?;
 
         let record = Record {
@@ -139,7 +198,6 @@ impl ProviderRegistry {
             .persistent()
             .set(&DataKey::Record(record_id.clone()), &record);
 
-        // Track this record_id under the provider's list for batch transfer.
         let list_key = DataKey::ProviderRecords(provider.clone());
         let mut ids: Vec<String> = env
             .storage()
@@ -160,7 +218,6 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Retrieve a medical record by ID.
     pub fn get_record(env: Env, record_id: String) -> Result<Record, ContractError> {
         env.storage()
             .persistent()
@@ -168,7 +225,6 @@ impl ProviderRegistry {
             .ok_or(ContractError::NotFound)
     }
 
-    /// Retrieve the total number of records ever created by a provider.
     pub fn get_provider_record_count(env: Env, provider: Address) -> u64 {
         env.storage()
             .persistent()
@@ -176,8 +232,6 @@ impl ProviderRegistry {
             .unwrap_or(0)
     }
 
-    /// Rate a provider with score 1..=5.
-    /// A patient can only rate the same provider once.
     pub fn rate_provider(
         env: Env,
         patient: Address,
@@ -189,9 +243,7 @@ impl ProviderRegistry {
         if !(1..=5).contains(&score) {
             return Err(ContractError::InvalidScore);
         }
-        if !Self::is_provider(env.clone(), provider.clone()) {
-            return Err(ContractError::NotFound);
-        }
+        Self::load_active_provider(&env, &provider)?;
 
         let patient_rating_key = DataKey::ProviderRatingByPatient(provider.clone(), patient);
         if env.storage().persistent().has(&patient_rating_key) {
@@ -220,7 +272,6 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Returns (total_ratings, average_score_scaled_by_100).
     pub fn get_provider_reputation(env: Env, provider: Address) -> (u64, u64) {
         let reputation_key = DataKey::ProviderReputation(provider);
         let reputation: ProviderReputation = env
@@ -239,12 +290,15 @@ impl ProviderRegistry {
         (reputation.total_ratings, average_scaled)
     }
 
-    /// Deactivate a provider: reassign all their records to `successor`,
-    /// remove them from the whitelist, and emit deactivation events. Admin only.
-    pub fn deactivate_provider(env: Env, admin: Address, provider: Address, successor: Address) {
+    pub fn deactivate_provider(
+        env: Env,
+        admin: Address,
+        provider: Address,
+        successor: Address,
+    ) -> Result<(), ContractError> {
         Self::assert_admin(&env, &admin);
+        Self::load_active_provider(&env, &successor)?;
 
-        // Batch-transfer every record created_by `provider` to `successor`.
         let list_key = DataKey::ProviderRecords(provider.clone());
         let ids: Vec<String> = env
             .storage()
@@ -261,7 +315,6 @@ impl ProviderRegistry {
             }
         }
 
-        // Move the record-id list to the successor's index.
         if count > 0 {
             let succ_key = DataKey::ProviderRecords(successor.clone());
             let mut succ_ids: Vec<String> = env
@@ -276,10 +329,16 @@ impl ProviderRegistry {
         }
         env.storage().persistent().remove(&list_key);
 
-        // Remove provider from whitelist.
-        env.storage()
+        let key = DataKey::Provider(provider.clone());
+        let mut profile: ProviderProfile = env
+            .storage()
             .persistent()
-            .remove(&DataKey::Provider(provider.clone()));
+            .get(&key)
+            .ok_or(ContractError::NotFound)?;
+        profile.active = false;
+        profile.credential.revoked_at = Some(env.ledger().timestamp());
+        profile.credential.revoked_by = Some(admin.clone());
+        env.storage().persistent().set(&key, &profile);
 
         env.events().publish(
             (symbol_short!("prov_deac"), provider.clone()),
@@ -287,9 +346,8 @@ impl ProviderRegistry {
         );
         env.events()
             .publish((symbol_short!("rec_xfer"), provider, successor), count);
+        Ok(())
     }
-
-    // ── helpers ──────────────────────────────────────────────────────────────
 
     fn assert_admin(env: &Env, caller: &Address) {
         caller.require_auth();
@@ -303,7 +361,49 @@ impl ProviderRegistry {
         }
     }
 
-    /// Per-provider counter with window start; resets when ledger time passes the window.
+    fn assert_future_expiry(env: &Env, expires_at: u64) -> Result<(), ContractError> {
+        if expires_at <= env.ledger().timestamp() {
+            return Err(ContractError::CredentialExpired);
+        }
+        Ok(())
+    }
+
+    fn provider_is_active(env: &Env, provider: &Address) -> bool {
+        let Some(profile) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProviderProfile>(&DataKey::Provider(provider.clone()))
+        else {
+            return false;
+        };
+
+        profile.active && Self::credential_is_active(env, &profile.credential).is_ok()
+    }
+
+    fn load_active_provider(env: &Env, provider: &Address) -> Result<ProviderProfile, ContractError> {
+        let profile: ProviderProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Provider(provider.clone()))
+            .ok_or(ContractError::NotFound)?;
+
+        if !profile.active {
+            return Err(ContractError::Unauthorized);
+        }
+        Self::credential_is_active(env, &profile.credential)?;
+        Ok(profile)
+    }
+
+    fn credential_is_active(env: &Env, credential: &CredentialAnchor) -> Result<(), ContractError> {
+        if credential.revoked_at.is_some() {
+            return Err(ContractError::CredentialRevoked);
+        }
+        if credential.expires_at <= env.ledger().timestamp() {
+            return Err(ContractError::CredentialExpired);
+        }
+        Ok(())
+    }
+
     fn consume_provider_rate_slot(env: &Env, provider: &Address) -> Result<(), ContractError> {
         let config_opt: Option<RateLimitConfig> =
             env.storage().instance().get(&DataKey::RateLimitConfig);
@@ -316,14 +416,14 @@ impl ProviderRegistry {
 
         let now = env.ledger().timestamp();
         let key = DataKey::ProviderRate(provider.clone());
-        let mut state: ProviderRateWindow =
-            env.storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(ProviderRateWindow {
-                    count: 0,
-                    window_start: 0,
-                });
+        let mut state: ProviderRateWindow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(ProviderRateWindow {
+                count: 0,
+                window_start: 0,
+            });
 
         let window_end = state.window_start.saturating_add(config.window_seconds);
         if state.window_start == 0 || now >= window_end {

@@ -1,6 +1,30 @@
 #![cfg(test)]
+
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, String, Vec};
+
+fn dummy_hash(env: &Env, byte: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[byte; 32])
+}
+
+fn register_hospital_with_anchor(
+    env: &Env,
+    client: &HospitalRegistryClient<'_>,
+    hospital_wallet: &Address,
+) {
+    let issuer = Address::generate(env);
+    client.register_hospital(
+        hospital_wallet,
+        &String::from_str(env, "General Hospital"),
+        &String::from_str(env, "123 Main St, New York, NY"),
+        &String::from_str(env, "Services: ER, Surgery, Cardiology"),
+        &issuer,
+        &dummy_hash(env, 1),
+        &dummy_hash(env, 2),
+        &4_100_000_000_u64,
+        &dummy_hash(env, 3),
+    );
+}
 
 #[test]
 fn test_register_hospital() {
@@ -11,15 +35,9 @@ fn test_register_hospital() {
     let hospital_wallet = Address::generate(&env);
     env.mock_all_auths();
 
-    client.register_hospital(
-        &hospital_wallet,
-        &String::from_str(&env, "General Hospital"),
-        &String::from_str(&env, "123 Main St, New York, NY"),
-        &String::from_str(&env, "Services: ER, Surgery, Cardiology"),
-    );
+    register_hospital_with_anchor(&env, &client, &hospital_wallet);
 
     let hospital = client.get_hospital(&hospital_wallet);
-
     assert_eq!(hospital.name, String::from_str(&env, "General Hospital"));
     assert_eq!(
         hospital.location,
@@ -29,6 +47,7 @@ fn test_register_hospital() {
         hospital.metadata,
         String::from_str(&env, "Services: ER, Surgery, Cardiology")
     );
+    assert_eq!(hospital.credential.credential_hash, dummy_hash(&env, 1));
 }
 
 #[test]
@@ -40,12 +59,7 @@ fn test_update_hospital() {
     let hospital_wallet = Address::generate(&env);
     env.mock_all_auths();
 
-    client.register_hospital(
-        &hospital_wallet,
-        &String::from_str(&env, "City Hospital"),
-        &String::from_str(&env, "456 Oak Ave"),
-        &String::from_str(&env, "General Services"),
-    );
+    register_hospital_with_anchor(&env, &client, &hospital_wallet);
 
     client.update_hospital(
         &hospital_wallet,
@@ -53,12 +67,11 @@ fn test_update_hospital() {
     );
 
     let hospital = client.get_hospital(&hospital_wallet);
-
     assert_eq!(
         hospital.metadata,
         String::from_str(&env, "Services: ER, ICU, Pediatrics, Oncology")
     );
-    assert_eq!(hospital.name, String::from_str(&env, "City Hospital"));
+    assert_eq!(hospital.name, String::from_str(&env, "General Hospital"));
 }
 
 #[test]
@@ -70,18 +83,19 @@ fn test_duplicate_registration() {
     let hospital_wallet = Address::generate(&env);
     env.mock_all_auths();
 
-    client.register_hospital(
-        &hospital_wallet,
-        &String::from_str(&env, "Test Hospital"),
-        &String::from_str(&env, "Test Location"),
-        &String::from_str(&env, "Test Metadata"),
-    );
+    register_hospital_with_anchor(&env, &client, &hospital_wallet);
 
+    let issuer = Address::generate(&env);
     let result = client.try_register_hospital(
         &hospital_wallet,
         &String::from_str(&env, "Test Hospital"),
         &String::from_str(&env, "Test Location"),
         &String::from_str(&env, "Test Metadata"),
+        &issuer,
+        &dummy_hash(&env, 4),
+        &dummy_hash(&env, 5),
+        &4_100_000_000_u64,
+        &dummy_hash(&env, 6),
     );
 
     assert_eq!(result, Err(Ok(ContractError::HospitalAlreadyRegistered)));
@@ -116,6 +130,40 @@ fn test_update_nonexistent_hospital() {
 }
 
 #[test]
+fn test_expired_hospital_credential_disables_membership() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, HospitalRegistry);
+    let client = HospitalRegistryClient::new(&env, &contract_id);
+
+    let hospital_wallet = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 100);
+
+    client.register_hospital(
+        &hospital_wallet,
+        &String::from_str(&env, "City Hospital"),
+        &String::from_str(&env, "456 Oak Ave"),
+        &String::from_str(&env, "General Services"),
+        &issuer,
+        &dummy_hash(&env, 1),
+        &dummy_hash(&env, 2),
+        &150_u64,
+        &dummy_hash(&env, 3),
+    );
+    assert!(client.is_hospital_active(&hospital_wallet));
+
+    env.ledger().with_mut(|li| li.timestamp = 151);
+    assert!(!client.is_hospital_active(&hospital_wallet));
+
+    let result = client.try_update_hospital(
+        &hospital_wallet,
+        &String::from_str(&env, "Should fail"),
+    );
+    assert_eq!(result, Err(Ok(ContractError::CredentialExpired)));
+}
+
+#[test]
 fn test_hospital_config_flow() {
     let env = Env::default();
     let contract_id = env.register_contract(None, HospitalRegistry);
@@ -124,12 +172,7 @@ fn test_hospital_config_flow() {
     let hospital_wallet = Address::generate(&env);
     env.mock_all_auths();
 
-    client.register_hospital(
-        &hospital_wallet,
-        &String::from_str(&env, "Regional Medical Center"),
-        &String::from_str(&env, "789 Pine Rd"),
-        &String::from_str(&env, "Accredited, trauma level II"),
-    );
+    register_hospital_with_anchor(&env, &client, &hospital_wallet);
 
     let mut departments: Vec<Department> = Vec::new(&env);
     departments.push_back(Department {

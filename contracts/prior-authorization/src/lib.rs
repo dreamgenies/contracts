@@ -75,6 +75,25 @@ impl PriorAuthorizationContract {
 
         let auth_request_id = next_auth_id(&env);
 
+        // Calculate SLA deadline based on urgency
+        let sla_config = load_sla_config(&env, &urgency)
+            .unwrap_or(SLAConfig {
+                urgency: urgency.clone(),
+                standard_deadline_hours: 72, // 3 days default
+                expedited_deadline_hours: 24, // 1 day default
+                auto_approval_threshold: 30, // 30 days default
+                requires_medical_director: false,
+            });
+
+        let is_expedited = urgency == Symbol::new(&env, "urgent") || urgency == Symbol::new(&env, "emergency");
+        let deadline_hours = if is_expedited {
+            sla_config.expedited_deadline_hours
+        } else {
+            sla_config.standard_deadline_hours
+        };
+
+        let sla_deadline = env.ledger().timestamp() + (deadline_hours * 3600); // Convert hours to seconds
+
         let req = AuthorizationRequest {
             auth_request_id,
             provider_id: provider_id.clone(),
@@ -85,7 +104,7 @@ impl PriorAuthorizationContract {
             service_codes,
             diagnosis_codes,
             clinical_justification_hash,
-            urgency,
+            urgency: urgency.clone(),
             status: AuthStatus::Submitted,
             decision: None,
             approved_units: None,
@@ -94,7 +113,11 @@ impl PriorAuthorizationContract {
             valid_until: None,
             submitted_at: env.ledger().timestamp(),
             decision_date: None,
-            expedited: false,
+            expedited: is_expedited,
+            reviewer_id: None,
+            reviewer_role: None,
+            sla_deadline,
+            auto_review_eligible: !sla_config.requires_medical_director,
         };
 
         save_auth_request(&env, &req);
@@ -103,7 +126,7 @@ impl PriorAuthorizationContract {
 
         env.events().publish(
             (Symbol::new(&env, "auth_submitted"),),
-            (auth_request_id, provider_id, patient_id),
+            (auth_request_id, provider_id, patient_id, sla_deadline),
         );
 
         Ok(auth_request_id)
@@ -162,6 +185,31 @@ impl PriorAuthorizationContract {
         let mut req = load_auth_request(&env, auth_request_id)
             .ok_or(Error::AuthRequestNotFound)?;
 
+        // Validate reviewer authorization
+        let reviewer = load_reviewer(&env, &reviewer_id)
+            .ok_or(Error::ReviewerNotFound)?;
+
+        if !reviewer.is_active {
+            return Err(Error::ReviewerNotAuthorized);
+        }
+
+        // Check if reviewer has expired
+        if let Some(expires_at) = reviewer.expires_at {
+            if env.ledger().timestamp() > expires_at {
+                return Err(Error::ReviewerNotAuthorized);
+            }
+        }
+
+        // Validate reviewer role and case load
+        if reviewer.current_cases >= reviewer.max_cases {
+            return Err(Error::SLAViolation);
+        }
+
+        // Check SLA deadline compliance
+        if env.ledger().timestamp() > req.sla_deadline {
+            return Err(Error::DeadlineExceeded);
+        }
+
         // Only Submitted, UnderReview, or MoreInfoNeeded can be reviewed
         match req.status {
             AuthStatus::Submitted
@@ -171,24 +219,52 @@ impl PriorAuthorizationContract {
             _ => return Err(Error::InvalidStatusTransition),
         }
 
+        // Validate reviewer role requirements
+        let medical_director_role = Symbol::new(&env, "medical_director");
+        let specialist_role = Symbol::new(&env, "specialist");
+        let reviewer_role_sym = Symbol::new(&env, "reviewer");
+        let case_manager_role = Symbol::new(&env, "case_manager");
+
+        // Check if medical director is required for this type
+        let sla_config = load_sla_config(&env, &req.urgency);
+        if let Some(config) = sla_config {
+            if config.requires_medical_director && reviewer.role != medical_director_role {
+                return Err(Error::InvalidReviewerRole);
+            }
+        }
+
         let approved_sym = Symbol::new(&env, "approved");
         let denied_sym = Symbol::new(&env, "denied");
         let more_info_sym = Symbol::new(&env, "more_info_needed");
 
+        // Update reviewer case count
+        update_reviewer_case_count(&env, &reviewer_id, 1)?;
+
         if decision == approved_sym {
             req.status = AuthStatus::Approved;
             req.approved_units = approved_units;
-            req.valid_from = valid_from;
-            req.valid_until = valid_until;
+            req.valid_from = valid_from.or(Some(env.ledger().timestamp()));
+            req.valid_until = valid_until.or(Some(env.ledger().timestamp() + (30 * 24 * 60 * 60))); // 30 days default
             req.decision_date = Some(env.ledger().timestamp());
+            
+            // Remove from overdue tracking if present
+            remove_overdue_auth(&env, auth_request_id);
         } else if decision == denied_sym {
             req.status = AuthStatus::Denied;
             req.decision_date = Some(env.ledger().timestamp());
+            
+            // Remove from overdue tracking if present
+            remove_overdue_auth(&env, auth_request_id);
         } else if decision == more_info_sym {
             req.status = AuthStatus::MoreInfoNeeded;
         } else {
+            // Revert case count increment for invalid decision
+            update_reviewer_case_count(&env, &reviewer_id, -1)?;
             return Err(Error::InvalidDecision);
         }
+
+        req.reviewer_id = Some(reviewer_id.clone());
+        req.reviewer_role = Some(reviewer.role.clone());
 
         req.decision = Some(decision.clone());
 
