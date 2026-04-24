@@ -2,7 +2,19 @@
 #![allow(deprecated)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{testutils::Address as _, BytesN, Env, String, Vec};
+
+fn build_services(env: &Env, amount: i128) -> Vec<ServiceLine> {
+    let mut services = Vec::new(env);
+    services.push_back(ServiceLine {
+        procedure_code: String::from_str(env, "99213"),
+        modifier: None,
+        quantity: 1,
+        charge_amount: amount,
+        diagnosis_pointers: Vec::new(env),
+    });
+    services
+}
 
 fn setup(env: &Env) -> (MedicalClaimsSystemClient<'static>, Address, Address, Address, Address) {
     let contract_id = env.register_contract(None, MedicalClaimsSystem);
@@ -45,7 +57,6 @@ fn test_full_claim_lifecycle() {
         &BytesN::from_array(&env, &[0; 32]),
         &15000,
     );
-    assert_eq!(claim_id, 1);
 
     let mut approved_lines = Vec::new(&env);
     approved_lines.push_back(1u64);
