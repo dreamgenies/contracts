@@ -8,11 +8,50 @@ mod types;
 #[cfg(test)]
 mod test;
 
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 use storage::*;
 use types::*;
 
 const MAX_APPEAL_LEVEL: u32 = 3;
+
+fn compute_review_entry_hash(env: &Env, review: &ReviewRecord) -> BytesN<32> {
+    let mut data = Bytes::new(env);
+    data.extend_from_array(&review.review_id.to_be_bytes());
+    data.extend_from_array(&review.auth_request_id.to_be_bytes());
+    data.append(&review.reviewer_id.clone().to_xdr(env));
+    data.append(&review.decision.clone().to_xdr(env));
+    data.append(&review.review_notes_hash.clone().to_xdr(env));
+    if let Some(prev_hash) = &review.prior_review_hash {
+        data.append(&prev_hash.clone().to_xdr(env));
+    }
+    data.extend_from_array(&review.timestamp.to_be_bytes());
+    env.crypto().sha256(&data)
+}
+
+fn compute_appeal_chain_hash(
+    env: &Env,
+    previous_appeal_hash: Option<BytesN<32>>,
+    ruling_dependency_hash: BytesN<32>,
+    appeal_reason_hash: BytesN<32>,
+    additional_evidence_hash: Option<BytesN<32>>,
+    provider_id: &Address,
+    appeal_level: u32,
+    submitted_at: u64,
+) -> BytesN<32> {
+    let mut data = Bytes::new(env);
+    if let Some(prev) = previous_appeal_hash {
+        data.append(&prev.clone().to_xdr(env));
+    }
+    data.append(&ruling_dependency_hash.clone().to_xdr(env));
+    data.append(&appeal_reason_hash.clone().to_xdr(env));
+    if let Some(additional) = additional_evidence_hash {
+        data.append(&additional.clone().to_xdr(env));
+    }
+    data.append(&provider_id.clone().to_xdr(env));
+    data.extend_from_array(&appeal_level.to_be_bytes());
+    data.extend_from_array(&submitted_at.to_be_bytes());
+    env.crypto().sha256(&data)
+}
 
 #[contract]
 pub struct PriorAuthorizationContract;
@@ -153,11 +192,41 @@ impl PriorAuthorizationContract {
 
         req.decision = Some(decision.clone());
 
+        // Persist review history in an append-only sequence.
+        let history = load_review_history(&env, auth_request_id);
+        let prior_review_hash = if history.is_empty() {
+            None
+        } else {
+            let last_review = history.get(history.len() - 1).unwrap();
+            Some(last_review.review_entry_hash.clone())
+        };
+        let review_notes_hash = env
+            .crypto()
+            .sha256(&review_notes.clone().to_xdr(&env));
+        let review_id = next_review_id(&env);
+        let mut review_record = ReviewRecord {
+            review_id,
+            auth_request_id,
+            reviewer_id: reviewer_id.clone(),
+            decision: decision.clone(),
+            review_notes_hash,
+            prior_review_hash,
+            review_entry_hash: BytesN::from_array(&env, &[0u8; 32]),
+            timestamp: env.ledger().timestamp(),
+        };
+        review_record.review_entry_hash = compute_review_entry_hash(&env, &review_record);
+        save_review_record(&env, &review_record);
+
         save_auth_request(&env, &req);
 
         env.events().publish(
             (Symbol::new(&env, "auth_reviewed"),),
-            (auth_request_id, decision, reviewer_id),
+            (
+                auth_request_id,
+                decision,
+                reviewer_id,
+                review_record.review_entry_hash,
+            ),
         );
 
         Ok(())
@@ -282,6 +351,39 @@ impl PriorAuthorizationContract {
 
         let appeal_id = next_appeal_id(&env);
 
+        let previous_appeal_id = if existing.is_empty() {
+            None
+        } else {
+            Some(existing.get(existing.len() - 1).unwrap().appeal_id)
+        };
+        let previous_appeal_hash = if existing.is_empty() {
+            None
+        } else {
+            Some(existing.get(existing.len() - 1).unwrap().appeal_chain_hash.clone())
+        };
+
+        let review_history = load_review_history(&env, auth_request_id);
+        let ruling_dependency_hash = if review_history.is_empty() {
+            env.crypto().sha256(&Bytes::new(&env))
+        } else {
+            review_history
+                .get(review_history.len() - 1)
+                .unwrap()
+                .review_entry_hash
+                .clone()
+        };
+
+        let appeal_chain_hash = compute_appeal_chain_hash(
+            &env,
+            previous_appeal_hash.clone(),
+            ruling_dependency_hash.clone(),
+            appeal_reason_hash.clone(),
+            additional_evidence_hash.clone(),
+            &provider_id,
+            appeal_level,
+            env.ledger().timestamp(),
+        );
+
         let appeal = Appeal {
             appeal_id,
             auth_request_id,
@@ -290,6 +392,10 @@ impl PriorAuthorizationContract {
             appeal_reason_hash,
             additional_evidence_hash,
             submitted_at: env.ledger().timestamp(),
+            previous_appeal_id,
+            previous_appeal_hash,
+            ruling_dependency_hash,
+            appeal_chain_hash,
         };
 
         save_appeal(&env, &appeal);
@@ -461,5 +567,25 @@ impl PriorAuthorizationContract {
             submitted_at: req.submitted_at,
             decision_date: req.decision_date,
         })
+    }
+
+    /// Return the full appeal timeline for an authorization request.
+    pub fn get_appeal_history(
+        env: Env,
+        auth_request_id: u64,
+        requester: Address,
+    ) -> Result<Vec<Appeal>, Error> {
+        requester.require_auth();
+        Ok(load_appeals_for_auth(&env, auth_request_id))
+    }
+
+    /// Return the full review history for an authorization request.
+    pub fn get_review_history(
+        env: Env,
+        auth_request_id: u64,
+        requester: Address,
+    ) -> Result<Vec<ReviewRecord>, Error> {
+        requester.require_auth();
+        Ok(load_review_history(&env, auth_request_id))
     }
 }
