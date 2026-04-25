@@ -1,7 +1,7 @@
 use crate::types::{
     AccessGrant, CdRecord, DataKey, ImagingReport, ImagingStudy, QcReview, SeriesInfo, ViewRecord,
 };
-use soroban_sdk::{Address, Env, String, Vec};
+use soroban_sdk::{Address, BytesN, Env, String, Vec};
 
 const BUMP_AMOUNT: u32 = 518400; // ~60 days in ledgers (assuming 5s ledger)
 const BUMP_THRESHOLD: u32 = 259200; // ~30 days
@@ -110,6 +110,51 @@ pub fn append_view_log(env: &Env, study_id: u64, record: &ViewRecord) {
     env.storage()
         .persistent()
         .extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+}
+
+pub fn load_view_logs(env: &Env, study_id: u64) -> Vec<ViewRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ViewLog(study_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn save_viewer_last_view_timestamp(
+    env: &Env,
+    study_id: u64,
+    viewer_id: &Address,
+    view_timestamp: u64,
+) {
+    let key = DataKey::ViewerLastViewTs(study_id, viewer_id.clone());
+    env.storage().persistent().set(&key, &view_timestamp);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+}
+
+pub fn load_viewer_last_view_timestamp(env: &Env, study_id: u64, viewer_id: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ViewerLastViewTs(study_id, viewer_id.clone()))
+}
+
+pub fn save_viewer_view_chain_head(
+    env: &Env,
+    study_id: u64,
+    viewer_id: &Address,
+    entry_hash: &BytesN<32>,
+) {
+    let key = DataKey::ViewerViewChainHead(study_id, viewer_id.clone());
+    env.storage().persistent().set(&key, entry_hash);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+}
+
+pub fn load_viewer_view_chain_head(env: &Env, study_id: u64, viewer_id: &Address) -> Option<BytesN<32>> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ViewerViewChainHead(study_id, viewer_id.clone()))
 }
 
 pub fn save_qc_review(env: &Env, review: &QcReview) {
