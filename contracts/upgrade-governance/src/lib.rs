@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short, Address, BytesN, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec,
 };
 
 mod test;
@@ -83,7 +83,9 @@ impl UpgradeGovernance {
             return Err(Error::InvalidThreshold);
         }
         env.storage().persistent().set(&DataKey::Signers, &signers);
-        env.storage().persistent().set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Threshold, &threshold);
         env.storage().persistent().set(&DataKey::NextId, &0u64);
         env.storage().persistent().set(&DataKey::Initialized, &true);
         Ok(())
@@ -138,8 +140,8 @@ impl UpgradeGovernance {
 
         let mut proposal = Self::load_votable_proposal(&env, proposal_id)?;
 
-        for i in 0..proposal.votes.len() {
-            if proposal.votes.get(i).unwrap() == voter {
+        for vote in proposal.votes.iter() {
+            if vote == voter {
                 return Err(Error::AlreadyVoted);
             }
         }
@@ -287,8 +289,8 @@ impl UpgradeGovernance {
             .persistent()
             .get(&DataKey::Signers)
             .ok_or(Error::NotInitialized)?;
-        for i in 0..signers.len() {
-            if signers.get(i).unwrap() == *caller {
+        for signer in signers.iter() {
+            if signer == *caller {
                 return Ok(());
             }
         }

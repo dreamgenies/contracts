@@ -93,7 +93,9 @@ impl MultisigGovernance {
             return Err(Error::InvalidThreshold);
         }
         env.storage().persistent().set(&DataKey::Signers, &signers);
-        env.storage().persistent().set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Threshold, &threshold);
         env.storage().persistent().set(&DataKey::Ttl, &ttl_seconds);
         env.storage().persistent().set(&DataKey::QuorumMin, &quorum_min);
         env.storage().persistent().set(&DataKey::Initialized, &true);
@@ -350,8 +352,8 @@ impl MultisigGovernance {
             .persistent()
             .get(&DataKey::Signers)
             .ok_or(Error::NotInitialized)?;
-        for i in 0..signers.len() {
-            if signers.get(i).unwrap() == *caller {
+        for signer in signers.iter() {
+            if signer == *caller {
                 return Ok(());
             }
         }
