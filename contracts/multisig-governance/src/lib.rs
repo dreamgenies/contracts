@@ -2,8 +2,8 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short, Address, Bytes, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol,
+    Vec,
 };
 
 mod test;
@@ -14,15 +14,15 @@ mod test;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized  = 1,
-    NotInitialized      = 2,
-    InvalidThreshold    = 3,
-    NotASigner          = 4,
-    ProposalExists      = 5,
-    ProposalNotFound    = 6,
-    AlreadyExecuted     = 7,
-    Expired             = 8,
-    AlreadyApproved     = 9,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    InvalidThreshold = 3,
+    NotASigner = 4,
+    ProposalExists = 5,
+    ProposalNotFound = 6,
+    AlreadyExecuted = 7,
+    Expired = 8,
+    AlreadyApproved = 9,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -72,7 +72,9 @@ impl MultisigGovernance {
             return Err(Error::InvalidThreshold);
         }
         env.storage().persistent().set(&DataKey::Signers, &signers);
-        env.storage().persistent().set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Threshold, &threshold);
         env.storage().persistent().set(&DataKey::Ttl, &ttl_seconds);
         env.storage().persistent().set(&DataKey::Initialized, &true);
         Ok(())
@@ -139,8 +141,8 @@ impl MultisigGovernance {
             return Err(Error::Expired);
         }
 
-        for i in 0..proposal.approvals.len() {
-            if proposal.approvals.get(i).unwrap() == signer {
+        for approval in proposal.approvals.iter() {
+            if approval == signer {
                 return Err(Error::AlreadyApproved);
             }
         }
@@ -195,8 +197,8 @@ impl MultisigGovernance {
             .persistent()
             .get(&DataKey::Signers)
             .ok_or(Error::NotInitialized)?;
-        for i in 0..signers.len() {
-            if signers.get(i).unwrap() == *caller {
+        for signer in signers.iter() {
+            if signer == *caller {
                 return Ok(());
             }
         }

@@ -282,7 +282,6 @@ fn test_dnr_with_advance_directives() {
 }
 
 #[test]
-#[should_panic(expected = "Emergency profile not found")]
 fn test_emergency_access_without_profile() {
     let env = Env::default();
     let contract_id = env.register_contract(None, EmergencyMedicalInfo);
@@ -293,13 +292,14 @@ fn test_emergency_access_without_profile() {
     env.mock_all_auths();
 
     // Try to access without profile
-    client.emergency_access_request(
+    let result = client.try_emergency_access_request(
         &provider,
         &patient,
         &Symbol::new(&env, "TRAUMA"),
         &String::from_str(&env, "Emergency"),
         &String::from_str(&env, "ER"),
     );
+    assert_eq!(result, Err(Ok(Error::EmergencyProfileNotFound)));
 }
 
 #[test]
