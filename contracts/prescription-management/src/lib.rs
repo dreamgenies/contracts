@@ -281,6 +281,7 @@ impl PrescriptionContract {
         // Validate pharmacy authorization
         if let Some(ref current_pharmacy) = p.current_pharmacy {
             if *current_pharmacy != pharmacy_id {
+            if current_pharmacy != &pharmacy_id {
                 return Err(Error::PharmacyNotAuthorized);
             }
         } else {
@@ -417,7 +418,7 @@ impl PrescriptionContract {
 
         // Verify pharmacy is the destination
         if let Some(ref current_pharmacy) = p.current_pharmacy {
-            if *current_pharmacy != pharmacy_id {
+            if current_pharmacy != &pharmacy_id {
                 return Err(Error::PharmacyNotAuthorized);
             }
         } else {
@@ -938,7 +939,7 @@ impl PrescriptionContract {
 
         // Validate pharmacy authorization
         if let Some(ref current_pharmacy) = p.current_pharmacy {
-            if *current_pharmacy != pharmacy_id {
+            if current_pharmacy != &pharmacy_id {
                 return Err(Error::PharmacyNotAuthorized);
             }
         } else {
